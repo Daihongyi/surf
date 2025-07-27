@@ -1,9 +1,9 @@
-use crate::core::{benchmark_url, build_client, download_file};
+use crate::core::{benchmark_url, build_client, download_file, TimeoutError};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use indicatif::HumanBytes;
 use std::{
-    io::Write,  // 添加 Write trait 导入
+    io::Write,
     path::PathBuf,
 };
 
@@ -37,9 +37,9 @@ enum Commands {
         #[arg(short = 'H', long)]
         headers: Vec<String>,
 
-        /// Timeout in seconds
-        #[arg(short = 't', long, default_value = "30")]
-        timeout: u64,
+        /// Connection timeout in seconds
+        #[arg(short = 't', long, default_value = "10")]
+        connect_timeout: u64,
 
         /// Display verbose output
         #[arg(short = 'v', long)]
@@ -66,9 +66,9 @@ enum Commands {
         #[arg(short = 'c', long)]
         continue_download: bool,
 
-        /// Timeout in seconds
+        /// Idle timeout in seconds (time between two packets)
         #[arg(short = 't', long, default_value = "30")]
-        timeout: u64,
+        idle_timeout: u64,
     },
 
     /// Benchmark a URL by sending multiple requests
@@ -84,9 +84,9 @@ enum Commands {
         #[arg(short = 'c', long, default_value = "10")]
         concurrency: usize,
 
-        /// Timeout in seconds
+        /// Connection timeout in seconds
         #[arg(short = 't', long, default_value = "5")]
-        timeout: u64,
+        connect_timeout: u64,
     },
 }
 
@@ -100,14 +100,14 @@ pub async fn execute() -> Result<()> {
             output,
             location,
             headers,
-            timeout,
+            connect_timeout,
             verbose,
             http3,
         } => {
-            let client = build_client(location, timeout, http3, headers)?;
+            let client = build_client(location, connect_timeout, http3, headers)?;
             let response = client.get(&url).send().await?;
 
-            // 在移动 response 前保存必要信息
+            // Save necessary info before moving response
             let status = response.status();
             let version = response.version();
             let response_headers = response.headers().clone();
@@ -133,7 +133,7 @@ pub async fn execute() -> Result<()> {
             match output {
                 Some(path) => {
                     let mut file = std::fs::File::create(path)?;
-                    file.write_all(content.as_bytes())?; // 现在可以正常调用 write_all
+                    file.write_all(content.as_bytes())?;
                 }
                 None => println!("{}", content),
             }
@@ -150,18 +150,24 @@ pub async fn execute() -> Result<()> {
             output,
             parallel,
             continue_download,
-            timeout,
-        } => {
-            download_file(&url, &output, parallel, continue_download, timeout).await
-        }
+            idle_timeout,
+        } => match download_file(&url, &output, parallel, continue_download, idle_timeout).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if let Some(timeout_err) = e.downcast_ref::<TimeoutError>() {
+                    eprintln!("Download failed: {}", timeout_err);
+                } else {
+                    eprintln!("Download failed: {}", e);
+                }
+                Err(e)
+            }
+        },
 
         Commands::Bench {
             url,
             requests,
             concurrency,
-            timeout,
-        } => {
-            benchmark_url(&url, requests, concurrency, timeout).await
-        }
+            connect_timeout,
+        } => benchmark_url(&url, requests, concurrency, connect_timeout).await,
     }
 }

@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use futures_util::StreamExt; // 添加 StreamExt 导入
+use futures_util::StreamExt;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -14,9 +14,26 @@ use std::{
 };
 use tokio::{fs, io::AsyncWriteExt};
 
+#[derive(Debug)]
+pub enum TimeoutError {
+    IdleTimeout,
+    ConnectTimeout,
+}
+
+impl std::fmt::Display for TimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            TimeoutError::IdleTimeout => write!(f, "Idle timeout: no data received"),
+            TimeoutError::ConnectTimeout => write!(f, "Connection timeout"),
+        }
+    }
+}
+
+impl std::error::Error for TimeoutError {}
+
 pub fn build_client(
     follow_redirects: bool,
-    timeout: u64,
+    connect_timeout: u64,
     http3: bool,
     headers: Vec<String>,
 ) -> Result<Client> {
@@ -30,8 +47,8 @@ pub fn build_client(
     };
     client_builder = client_builder.redirect(redirect_policy);
 
-    // Set timeout
-    client_builder = client_builder.timeout(Duration::from_secs(timeout));
+    // Set connection timeout only
+    client_builder = client_builder.connect_timeout(Duration::from_secs(connect_timeout));
 
     // Add custom headers
     let mut header_map = HeaderMap::new();
@@ -58,11 +75,11 @@ pub fn build_client(
 pub async fn download_file(
     url: &str,
     output: &PathBuf,
-    _parallel: usize, // 暂时未使用，添加下划线前缀
+    _parallel: usize,
     continue_download: bool,
-    timeout: u64,
+    idle_timeout: u64,
 ) -> Result<()> {
-    let client = build_client(true, timeout, false, vec![])?;
+    let client = build_client(true, 10, false, vec![])?;
 
     // Get file size
     let head_response = client.head(url).send().await?;
@@ -80,12 +97,15 @@ pub async fn download_file(
         downloaded = metadata.len();
     }
 
-    // Create progress bar with speed display
+    // Create progress bar with timeout status display
     let pb = ProgressBar::new(total_size);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) | {binary_bytes_per_sec}")?
-        .progress_chars("#>-"));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) | {binary_bytes_per_sec} | {msg}")?
+            .progress_chars("#>-"),
+    );
     pb.set_position(downloaded);
+    pb.set_message("Connecting...");
 
     // Download file
     let mut file = fs::OpenOptions::new()
@@ -94,36 +114,52 @@ pub async fn download_file(
         .open(output)
         .await?;
 
-    // 记录下载开始时间和初始下载量
+    // Record start time and initial downloaded bytes
     let start_time = Instant::now();
     let initial_downloaded = downloaded;
 
     if downloaded < total_size {
         let mut request = client.get(url);
         if downloaded > 0 {
-            request = request.header(
-                "Range",
-                format!("bytes={}-", downloaded), // 修复 Range 头格式
-            );
+            request = request.header("Range", format!("bytes={}-", downloaded));
         }
 
-        let response = request.send().await?;
+        pb.set_message("Downloading...");
+
+        let response = request.send().await.map_err(|e| {
+            if e.is_timeout() {
+                anyhow!(TimeoutError::ConnectTimeout)
+            } else {
+                anyhow!(e)
+            }
+        })?;
+
         if response.status() != StatusCode::OK && response.status() != StatusCode::PARTIAL_CONTENT {
             return Err(anyhow!("Failed to download: {}", response.status()));
         }
 
         let mut stream = response.bytes_stream();
+        let mut last_data_time = Instant::now();
+        let idle_duration = Duration::from_secs(idle_timeout);
 
-        // 使用 StreamExt 的 next() 方法
         while let Some(item) = stream.next().await {
+            // Check for idle timeout
+            if last_data_time.elapsed() > idle_duration {
+                pb.set_message("IDLE TIMEOUT");
+                return Err(anyhow!(TimeoutError::IdleTimeout));
+            }
+
             let chunk = item?;
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
             pb.set_position(downloaded);
+
+            // Update last data time
+            last_data_time = Instant::now();
         }
     }
 
-    // 计算下载速度和平均速度
+    // Calculate download speed
     let elapsed_time = start_time.elapsed();
     let download_size = downloaded - initial_downloaded;
     let avg_speed = if elapsed_time.as_secs_f64() > 0.0 {
@@ -132,10 +168,11 @@ pub async fn download_file(
         download_size as f64
     };
 
-    // 获取绝对路径并格式化输出
+    // Get absolute path for output
     let abs_path = output.canonicalize().unwrap_or_else(|_| output.clone());
     let abs_path_str = abs_path.display().to_string();
 
+    pb.set_message("Completed");
     pb.finish_with_message(format!(
         "Downloaded {} in {:.2}s (avg: {}/s) to: {}",
         HumanBytes(downloaded),
@@ -147,10 +184,18 @@ pub async fn download_file(
     Ok(())
 }
 
-pub async fn benchmark_url(url: &str, requests: usize, concurrency: usize, timeout: u64) -> Result<()> {
-    let client = build_client(true, timeout, false, vec![])?;
+pub async fn benchmark_url(
+    url: &str,
+    requests: usize,
+    concurrency: usize,
+    connect_timeout: u64,
+) -> Result<()> {
+    let client = build_client(true, connect_timeout, false, vec![])?;
 
-    println!("Benchmarking {} with {} requests, concurrency {}", url, requests, concurrency);
+    println!(
+        "Benchmarking {} with {} requests, concurrency {}",
+        url, requests, concurrency
+    );
 
     let start = Instant::now();
 
