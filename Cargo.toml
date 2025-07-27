@@ -1,0 +1,22 @@
+[package]
+name = "surf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"           # 强大的错误处理
+clap = { version = "4.0", features = ["derive"] } # 命令行参数解析
+indicatif = "0.17.0"     # 终端进度条和状态显示
+reqwest = { version = "0.11.0", features = ["json", "stream", "rustls-tls", "hickory-dns"] } # HTTP客户端
+tokio = { version = "1.0", features = ["full", "macros", "rt-multi-thread"] } # 异步运行时
+serde = { version = "1.0", features = ["derive"] } # 序列化支持
+futures = "0.3"          # 异步流处理
+serde_json = "1.0"       # JSON处理
+bytes = "1.0"            # 字节缓冲区处理
+futures-util = "0.3"     # 异步流实用工具
+
+# 可选：HTTP/3支持（需要启用特性）
+
+quinn = "0.10.0"         # QUIC协议实现
+rustls = "0.22.0"
+webpki-roots = "0.25.4"        # TLS加密库
