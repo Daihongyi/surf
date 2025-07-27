@@ -22,12 +22,12 @@ Surf is a modern HTTP client with advanced features for developers and system ad
 
 ### Install from source
 ```bash
-cargo install --git https://github.com/yourusername/surf.git
+cargo install --git https://github.com/Daihongyi/surf.git
 ```
 
 ### Build from source
 ```bash
-git clone https://github.com/yourusername/surf.git
+git clone https://github.com/Daihongyi/surf.git
 cd surf
 cargo build --release
 ```
