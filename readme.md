@@ -1,7 +1,7 @@
 
 # Surf - Modern HTTP Command-Line Client
 
-![Rust](https://img.shields.io/badge/Rust-1.70%2B-blue) ![License](https://img.shields.io/badge/License-MIT-orange)
+![Rust](https://img.shields.io/badge/Rust-1.70%2B-blue) ![License](https://img.shields.io/badge/License-GPLv3-orange)
 
 Surf is a modern HTTP client with advanced features for developers and system administrators. It provides intuitive command-line tools for interacting with web services, downloading files, and benchmarking web endpoints.
 
