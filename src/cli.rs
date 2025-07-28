@@ -69,6 +69,10 @@ enum Commands {
         /// Idle timeout in seconds (time between two packets)
         #[arg(short = 't', long, default_value = "30")]
         idle_timeout: u64,
+
+        /// Use HTTP/3 (experimental)
+        #[arg(long)]
+        http3: bool,
     },
 
     /// Benchmark a URL by sending multiple requests
@@ -87,6 +91,10 @@ enum Commands {
         /// Connection timeout in seconds
         #[arg(short = 't', long, default_value = "5")]
         connect_timeout: u64,
+
+        /// Use HTTP/3 (experimental)
+        #[arg(long)]
+        http3: bool,
     },
 }
 
@@ -151,23 +159,28 @@ pub async fn execute() -> Result<()> {
             parallel,
             continue_download,
             idle_timeout,
-        } => match download_file(&url, &output, parallel, continue_download, idle_timeout).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if let Some(timeout_err) = e.downcast_ref::<TimeoutError>() {
-                    eprintln!("Download failed: {}", timeout_err);
-                } else {
-                    eprintln!("Download failed: {}", e);
+            http3,
+        } => {
+            match download_file(&url, &output, parallel, continue_download, idle_timeout, http3).await
+            {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    if let Some(timeout_err) = e.downcast_ref::<TimeoutError>() {
+                        eprintln!("Download failed: {}", timeout_err);
+                    } else {
+                        eprintln!("Download failed: {}", e);
+                    }
+                    Err(e)
                 }
-                Err(e)
             }
-        },
+        }
 
         Commands::Bench {
             url,
             requests,
             concurrency,
             connect_timeout,
-        } => benchmark_url(&url, requests, concurrency, connect_timeout).await,
+            http3,
+        } => benchmark_url(&url, requests, concurrency, connect_timeout, http3).await,
     }
 }

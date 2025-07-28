@@ -61,12 +61,21 @@ pub fn build_client(
     }
     client_builder = client_builder.default_headers(header_map);
 
-    // HTTP/3 support (requires rustls and quinn)
-    #[cfg(feature = "http3")]
+    // HTTP/3 support with compile-time check
     if http3 {
-        client_builder = client_builder
-            .use_rustls_tls()
-            .http3_prior_knowledge();
+        #[cfg(not(feature = "http3"))]
+        {
+            return Err(anyhow!(
+                "HTTP/3 support was not enabled at compile time. \
+                Please rebuild with `RUSTFLAGS=\"--cfg reqwest_unstable\"` and the `http3` feature."
+            ));
+        }
+        #[cfg(feature = "http3")]
+        {
+            client_builder = client_builder
+                .use_rustls_tls()
+                .http3_prior_knowledge();
+        }
     }
 
     Ok(client_builder.build()?)
@@ -78,8 +87,9 @@ pub async fn download_file(
     _parallel: usize,
     continue_download: bool,
     idle_timeout: u64,
+    http3: bool,
 ) -> Result<()> {
-    let client = build_client(true, 10, false, vec![])?;
+    let client = build_client(true, 10, http3, vec![])?;
 
     // Get file size
     let head_response = client.head(url).send().await?;
@@ -105,7 +115,8 @@ pub async fn download_file(
             .progress_chars("#>-"),
     );
     pb.set_position(downloaded);
-    pb.set_message("Connecting...");
+    // 修改点1: Connecting显示为橙色
+    pb.set_message("\x1b[33mConnecting...\x1b[0m");
 
     // Download file
     let mut file = fs::OpenOptions::new()
@@ -124,7 +135,8 @@ pub async fn download_file(
             request = request.header("Range", format!("bytes={}-", downloaded));
         }
 
-        pb.set_message("Downloading...");
+        // 修改点2: Downloading显示为绿色
+        pb.set_message("\x1b[32mDownloading...\x1b[0m");
 
         let response = request.send().await.map_err(|e| {
             if e.is_timeout() {
@@ -145,7 +157,8 @@ pub async fn download_file(
         while let Some(item) = stream.next().await {
             // Check for idle timeout
             if last_data_time.elapsed() > idle_duration {
-                pb.set_message("IDLE TIMEOUT");
+                // 修改点3: Timeout显示为红色
+                pb.set_message("\x1b[31mIDLE TIMEOUT\x1b[0m");
                 return Err(anyhow!(TimeoutError::IdleTimeout));
             }
 
@@ -189,12 +202,13 @@ pub async fn benchmark_url(
     requests: usize,
     concurrency: usize,
     connect_timeout: u64,
+    http3: bool,
 ) -> Result<()> {
-    let client = build_client(true, connect_timeout, false, vec![])?;
+    let client = build_client(true, connect_timeout, http3, vec![])?;
 
     println!(
-        "Benchmarking {} with {} requests, concurrency {}",
-        url, requests, concurrency
+        "Benchmarking {} with {} requests, concurrency {} (HTTP/3: {})",
+        url, requests, concurrency, http3
     );
 
     let start = Instant::now();
