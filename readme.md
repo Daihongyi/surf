@@ -1,4 +1,4 @@
-```markdown
+
 # Surf - Modern HTTP Command-Line Client
 
 ![Rust](https://img.shields.io/badge/Rust-1.70%2B-blue) ![License](https://img.shields.io/badge/License-MIT-orange)
@@ -24,6 +24,11 @@ Surf is a modern HTTP client with advanced features for developers and system ad
 ```bash
 cargo install --git https://github.com/Daihongyi/surf.git
 ```
+### Or enable the http3
+```bash
+RUSTFLAGS='--cfg reqwest_unstable' cargo install --git https://github.com/Daihongyi/surf.git --features http3
+```
+
 
 ### Build from source
 ```bash
@@ -31,8 +36,13 @@ git clone https://github.com/Daihongyi/surf.git
 cd surf
 cargo build --release
 ```
-
+### Enable http3 (beta)
+```bash
+RUSTFLAGS='--cfg reqwest_unstable' cargo build --features http3
+```
 The binary will be available at `target/release/surf`.
+
+
 
 ## Usage
 
