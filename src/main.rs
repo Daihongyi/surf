@@ -1,5 +1,6 @@
 mod cli;
 mod core;
+mod log;
 
 use anyhow::Result;
 

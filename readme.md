@@ -68,6 +68,7 @@ surf get [OPTIONS] <URL>
 - `-t`, `--timeout <SECONDS>`: Timeout in seconds (default: 30)
 - `-v`, `--verbose`: Display verbose output
 - `--http3`: Use HTTP/3 (experimental)
+- `--log`:Save log 
 
 **Examples:**
 ```bash
@@ -127,7 +128,9 @@ surf bench -n 1000 -c 50 https://stress-test.example.com
 ```
 
 ## Output Examples
+```
 
+```
 ### Verbose GET request
 ```
 > HTTP/1.1 200 OK
