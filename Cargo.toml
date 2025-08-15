@@ -5,12 +5,18 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-chrono = "0.4.41"
+chrono = { version = "0.4.41" ,features = ["serde"]}
 clap = { version = "4.0", features = ["derive"] }
 futures-util = "0.3"
 indicatif = "0.17"
 reqwest = { version = "0.11", features = ["json", "stream", "rustls-tls"], default-features = false }
 tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0.219", features = ["derive"] }
+toml = "0.9.5"
+dirs = "6.0.0"
+serde_json = "1.0.142"
+uuid = { version = "1.18.0" ,features = ["v4"]}
+colored = "3.0.0"
 
 [features]
 default = []

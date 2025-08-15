@@ -1,6 +1,9 @@
 mod cli;
 mod core;
 mod log;
+mod config;
+mod history;
+mod response;
 
 use anyhow::Result;
 

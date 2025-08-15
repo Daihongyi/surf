@@ -8,12 +8,12 @@ use reqwest::{
     Client, ClientBuilder, StatusCode,
 };
 use std::{
-    io::Write,
     path::PathBuf,
     str::FromStr,
+    sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{fs, io::AsyncWriteExt, sync::Semaphore};
 
 #[derive(Debug)]
 pub enum TimeoutError {
@@ -54,6 +54,9 @@ pub fn build_client(
 
     // Set connection timeout only
     client_builder = client_builder.connect_timeout(Duration::from_secs(connect_timeout));
+
+    // Set total timeout for requests
+    client_builder = client_builder.timeout(Duration::from_secs(connect_timeout * 3));
 
     // Add custom headers
     let mut header_map = HeaderMap::new();
@@ -113,18 +116,18 @@ pub fn build_client(
 pub async fn download_file(
     url: &str,
     output: &PathBuf,
-    _parallel: usize,
+    parallel: usize,
     continue_download: bool,
     idle_timeout: u64,
     http3: bool,
 ) -> Result<()> {
     log_info(&format!("Starting file download from: {}", url));
-    log_debug(&format!("Download settings - output: {}, continue: {}, idle_timeout: {}s",
-                       output.display(), continue_download, idle_timeout));
+    log_debug(&format!("Download settings - output: {}, parallel: {}, continue: {}, idle_timeout: {}s",
+                       output.display(), parallel, continue_download, idle_timeout));
 
     let client = build_client(true, 10, http3, vec![])?;
 
-    // Get file size
+    // Get file size and check if server supports range requests
     log_debug("Sending HEAD request to get file size");
     let head_response = match client.head(url).send().await {
         Ok(response) => {
@@ -144,11 +147,20 @@ pub async fn download_file(
         .and_then(|ct_len| ct_len.parse::<u64>().ok())
         .unwrap_or(0);
 
+    let supports_range = head_response
+        .headers()
+        .get(reqwest::header::ACCEPT_RANGES)
+        .and_then(|ar| ar.to_str().ok())
+        .map(|ar| ar == "bytes")
+        .unwrap_or(false);
+
     log_info(&format!("File size: {}", if total_size > 0 {
         format!("{}", HumanBytes(total_size))
     } else {
         "unknown".to_string()
     }));
+
+    log_debug(&format!("Range requests supported: {}", supports_range));
 
     // Check if we can resume
     let mut downloaded = 0;
@@ -157,6 +169,28 @@ pub async fn download_file(
         downloaded = metadata.len();
         log_info(&format!("Resuming download, {} already downloaded", HumanBytes(downloaded)));
     }
+
+    // Use parallel download only if server supports range requests and file is large enough
+    let use_parallel = supports_range && total_size > 0 && parallel > 1 && total_size > 10_000_000; // 10MB threshold
+
+    if use_parallel {
+        log_info(&format!("Using parallel download with {} connections", parallel));
+        download_parallel(url, output, total_size, downloaded, parallel, idle_timeout, http3).await
+    } else {
+        log_info("Using single connection download");
+        download_single(url, output, downloaded, total_size, idle_timeout, http3).await
+    }
+}
+
+async fn download_single(
+    url: &str,
+    output: &PathBuf,
+    downloaded: u64,
+    total_size: u64,
+    idle_timeout: u64,
+    http3: bool,
+) -> Result<()> {
+    let client = build_client(true, 10, http3, vec![])?;
 
     // Create progress bar with timeout status display
     let pb = ProgressBar::new(total_size);
@@ -187,12 +221,13 @@ pub async fn download_file(
     // Record start time and initial downloaded bytes
     let start_time = Instant::now();
     let initial_downloaded = downloaded;
+    let mut current_downloaded = downloaded;
 
-    if downloaded < total_size {
+    if current_downloaded < total_size || total_size == 0 {
         let mut request = client.get(url);
-        if downloaded > 0 {
-            request = request.header("Range", format!("bytes={}-", downloaded));
-            log_debug(&format!("Using Range header: bytes={}-", downloaded));
+        if current_downloaded > 0 {
+            request = request.header("Range", format!("bytes={}-", current_downloaded));
+            log_debug(&format!("Using Range header: bytes={}-", current_downloaded));
         }
 
         pb.set_message("\x1b[32mDownloading...\x1b[0m");
@@ -244,13 +279,13 @@ pub async fn download_file(
                 return Err(e.into());
             }
 
-            downloaded += chunk.len() as u64;
-            pb.set_position(downloaded);
+            current_downloaded += chunk.len() as u64;
+            pb.set_position(current_downloaded);
             chunk_count += 1;
 
             // Log progress every 1000 chunks to avoid spam
             if chunk_count % 1000 == 0 {
-                log_debug(&format!("Downloaded {} bytes so far", downloaded));
+                log_debug(&format!("Downloaded {} bytes so far", current_downloaded));
             }
 
             // Update last data time
@@ -264,7 +299,7 @@ pub async fn download_file(
 
     // Calculate download speed
     let elapsed_time = start_time.elapsed();
-    let download_size = downloaded - initial_downloaded;
+    let download_size = current_downloaded - initial_downloaded;
     let avg_speed = if elapsed_time.as_secs_f64() > 0.0 {
         download_size as f64 / elapsed_time.as_secs_f64()
     } else {
@@ -278,7 +313,7 @@ pub async fn download_file(
     pb.set_message("Completed");
     let completion_msg = format!(
         "Downloaded {} in {:.2}s (avg: {}/s) to: {}",
-        HumanBytes(downloaded),
+        HumanBytes(current_downloaded),
         elapsed_time.as_secs_f64(),
         HumanBytes(avg_speed as u64),
         abs_path_str
@@ -287,6 +322,122 @@ pub async fn download_file(
 
     log_info(&format!("Download completed successfully: {}", completion_msg));
 
+    Ok(())
+}
+
+async fn download_parallel(
+    url: &str,
+    output: &PathBuf,
+    total_size: u64,
+    downloaded: u64,
+    parallel: usize,
+    idle_timeout: u64,
+    http3: bool,
+) -> Result<()> {
+    let remaining = total_size - downloaded;
+    let chunk_size = remaining / parallel as u64;
+
+    if chunk_size == 0 {
+        return download_single(url, output, downloaded, total_size, idle_timeout, http3).await;
+    }
+
+    log_info(&format!("Parallel download: {} chunks of ~{} bytes each",
+                      parallel, HumanBytes(chunk_size)));
+
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) | {binary_bytes_per_sec}")?
+            .progress_chars("#>-"),
+    );
+    pb.set_position(downloaded);
+
+    let client = build_client(true, 10, http3, vec![])?;
+    let semaphore = Arc::new(Semaphore::new(parallel));
+    let pb = Arc::new(pb);
+
+    let mut tasks = Vec::new();
+    let start_time = Instant::now();
+
+    for i in 0..parallel {
+        let start = downloaded + i as u64 * chunk_size;
+        let end = if i == parallel - 1 {
+            total_size - 1
+        } else {
+            downloaded + (i + 1) as u64 * chunk_size - 1
+        };
+
+        let client = client.clone();
+        let url = url.to_string();
+        let semaphore = Arc::clone(&semaphore);
+        let pb = Arc::clone(&pb);
+        let temp_path = output.with_extension(format!("part{}", i));
+
+        let task = tokio::spawn(async move {
+            let _permit = semaphore.acquire().await?;
+
+            let mut request = client.get(&url);
+            request = request.header("Range", format!("bytes={}-{}", start, end));
+
+            let response = request.send().await?;
+            if response.status() != StatusCode::PARTIAL_CONTENT {
+                return Err(anyhow!("Server doesn't support range requests"));
+            }
+
+            let mut file = fs::File::create(&temp_path).await?;
+            let mut stream = response.bytes_stream();
+            let mut bytes_written = 0u64;
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                file.write_all(&chunk).await?;
+                bytes_written += chunk.len() as u64;
+                pb.inc(chunk.len() as u64);
+            }
+
+            Ok::<(PathBuf, u64), anyhow::Error>((temp_path, bytes_written))
+        });
+
+        tasks.push(task);
+    }
+
+    // Wait for all downloads to complete
+    let mut temp_files = Vec::new();
+    for task in tasks {
+        let (temp_path, _) = task.await??;
+        temp_files.push(temp_path);
+    }
+
+    // Merge all temporary files
+    pb.set_message("Merging files...");
+    let mut final_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(output)
+        .await?;
+
+    for temp_file in &temp_files {
+        let mut temp = fs::File::open(temp_file).await?;
+        tokio::io::copy(&mut temp, &mut final_file).await?;
+    }
+
+    // Clean up temporary files
+    for temp_file in temp_files {
+        let _ = fs::remove_file(temp_file).await;
+    }
+
+    let elapsed = start_time.elapsed();
+    let speed = total_size as f64 / elapsed.as_secs_f64();
+
+    pb.finish_with_message(format!(
+        "Downloaded {} in {:.2}s (avg: {}/s)",
+        HumanBytes(total_size),
+        elapsed.as_secs_f64(),
+        HumanBytes(speed as u64)
+    ));
+
+    log_info("Parallel download completed successfully");
     Ok(())
 }
 
@@ -310,62 +461,83 @@ pub async fn benchmark_url(
     let start = Instant::now();
     let mut successful_requests = 0;
     let mut failed_requests = 0;
+    let mut response_times = Vec::new();
+    let mut status_codes = std::collections::HashMap::new();
 
+    let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::new();
+
     for i in 0..requests {
         let client = client.clone();
         let url = url.to_string();
+        let semaphore = Arc::clone(&semaphore);
+
         let task = tokio::spawn(async move {
+            let _permit = semaphore.acquire().await?;
             let start = Instant::now();
             let response = client.get(&url).send().await;
             let duration = start.elapsed();
             match response {
-                Ok(resp) => (duration, resp.status().as_u16()),
-                Err(_) => (duration, 0),
+                Ok(resp) => Ok((duration, resp.status().as_u16())),
+                Err(_) => Ok((duration, 0)),
             }
         });
         tasks.push(task);
 
-        if tasks.len() >= concurrency {
-            let task = tasks.remove(0);
-            let (duration, status) = task.await?;
-            println!("Status: {:3} | Time: {:?}", status, duration);
-
-            if status >= 200 && status < 400 {
-                successful_requests += 1;
-            } else {
-                failed_requests += 1;
-                log_warn(&format!("Request failed with status: {}", status));
-            }
-
-            // Log progress every 50 requests
-            if (i + 1) % 50 == 0 {
-                log_debug(&format!("Completed {} requests", i + 1));
-            }
+        // Log progress every 50 requests
+        if (i + 1) % 50 == 0 {
+            log_debug(&format!("Started {} requests", i + 1));
         }
     }
 
-    // Wait for remaining tasks
+    // Wait for all tasks
     for task in tasks {
-        let (duration, status) = task.await?;
-        println!("Status: {:3} | Time: {:?}", status, duration);
+        let result: Result<(Duration, u16), anyhow::Error> = task.await?;
+        let (duration, status) = result?;
+
+        response_times.push(duration.as_millis() as u64);
+        *status_codes.entry(status).or_insert(0) += 1;
 
         if status >= 200 && status < 400 {
             successful_requests += 1;
         } else {
             failed_requests += 1;
-            log_warn(&format!("Request failed with status: {}", status));
+            if status != 0 {
+                log_warn(&format!("Request failed with status: {}", status));
+            }
         }
     }
 
     let total_time = start.elapsed();
     let rps = requests as f64 / total_time.as_secs_f64();
 
-    println!("\nBenchmark complete");
+    // Calculate statistics
+    response_times.sort_unstable();
+    let min_time = response_times.first().copied().unwrap_or(0);
+    let max_time = response_times.last().copied().unwrap_or(0);
+    let avg_time = response_times.iter().sum::<u64>() / response_times.len() as u64;
+    let p50 = response_times.get(response_times.len() / 2).copied().unwrap_or(0);
+    let p95 = response_times.get((response_times.len() as f64 * 0.95) as usize).copied().unwrap_or(0);
+    let p99 = response_times.get((response_times.len() as f64 * 0.99) as usize).copied().unwrap_or(0);
+
+    println!("\n=== Benchmark Results ===");
     println!("Total time: {:.2}s", total_time.as_secs_f64());
     println!("Requests per second: {:.2}", rps);
     println!("Successful requests: {}", successful_requests);
     println!("Failed requests: {}", failed_requests);
+    println!();
+    println!("Response Times (ms):");
+    println!("  Min: {}", min_time);
+    println!("  Max: {}", max_time);
+    println!("  Avg: {}", avg_time);
+    println!("  50th percentile: {}", p50);
+    println!("  95th percentile: {}", p95);
+    println!("  99th percentile: {}", p99);
+    println!();
+    println!("Status Code Distribution:");
+    for (status, count) in status_codes.iter() {
+        println!("  {}: {} ({:.1}%)", status, count, (*count as f64 / requests as f64) * 100.0);
+    }
 
     log_info(&format!("Benchmark completed - Total: {:.2}s, RPS: {:.2}, Success: {}, Failed: {}",
                       total_time.as_secs_f64(), rps, successful_requests, failed_requests));
