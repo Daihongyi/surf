@@ -4,6 +4,7 @@ mod log;
 mod config;
 mod history;
 mod response;
+mod cache;
 
 use anyhow::Result;
 

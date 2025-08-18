@@ -3,6 +3,7 @@ use crate::log::{init_logger, log_info, log_error, log_debug, log_warn};
 use crate::config::{Config, Profile};
 use crate::history::{RequestHistory, HistoryEntry};
 use crate::response::{ResponseFormatter, ResponseAnalyzer};
+use crate::cache::CachedConfig;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::{
@@ -13,7 +14,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(name = "surf", version = "0.3.0", about = "A modern HTTP client with advanced features")]
+#[command(name = "surf", version = "0.3.5", about = "A modern HTTP client with advanced features")]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -29,6 +30,14 @@ pub struct Cli {
     /// Disable colored output
     #[arg(long, global = true)]
     no_color: bool,
+
+    /// Use cached configuration from last run
+    #[arg(short = 'x', long, global = true)]
+    use_cache: bool,
+
+    /// Do not save configuration to cache
+    #[arg(long, global = true)]
+    no_save: bool,
 }
 
 #[derive(Subcommand)]
@@ -143,6 +152,12 @@ enum Commands {
         #[command(subcommand)]
         action: ProfileAction,
     },
+
+    /// Cache management
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -212,6 +227,14 @@ enum ProfileAction {
     },
 }
 
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Show cached configuration
+    Show,
+    /// Clear cached configuration
+    Clear,
+}
+
 pub async fn execute() -> Result<()> {
     let args = Cli::parse();
 
@@ -266,9 +289,10 @@ pub async fn execute() -> Result<()> {
             analyze,
             save_history,
         } => {
-            handle_get_request(
+            handle_get_request_with_cache(
                 &url, include, output, location, headers, connect_timeout,
-                verbose, http3, json, analyze, save_history, &config, args.no_color
+                verbose, http3, json, analyze, save_history, &config, args.no_color,
+                args.use_cache, args.no_save, args.profile
             ).await
         }
 
@@ -280,26 +304,10 @@ pub async fn execute() -> Result<()> {
             idle_timeout,
             http3,
         } => {
-            log_info(&format!("Starting download from: {}", url));
-            log_debug(&format!("Download parameters - output: {}, parallel: {}, continue: {}, timeout: {}s, http3: {}",
-                               output.display(), parallel, continue_download, idle_timeout, http3));
-
-            match download_file(&url, &output, parallel, continue_download, idle_timeout, http3).await {
-                Ok(_) => {
-                    log_info("Download completed successfully");
-                    Ok(())
-                }
-                Err(e) => {
-                    if let Some(timeout_err) = e.downcast_ref::<TimeoutError>() {
-                        log_error(&format!("Download failed with timeout: {}", timeout_err));
-                        eprintln!("Download failed: {}", timeout_err);
-                    } else {
-                        log_error(&format!("Download failed: {}", e));
-                        eprintln!("Download failed: {}", e);
-                    }
-                    Err(e)
-                }
-            }
+            handle_download_with_cache(
+                &url, output, parallel, continue_download, idle_timeout, http3,
+                args.no_color, args.use_cache, args.no_save, args.profile
+            ).await
         }
 
         Commands::Bench {
@@ -309,20 +317,10 @@ pub async fn execute() -> Result<()> {
             connect_timeout,
             http3,
         } => {
-            log_info(&format!("Starting benchmark for: {}", url));
-            log_debug(&format!("Benchmark parameters - requests: {}, concurrency: {}, timeout: {}s, http3: {}",
-                               requests, concurrency, connect_timeout, http3));
-
-            match benchmark_url(&url, requests, concurrency, connect_timeout, http3).await {
-                Ok(_) => {
-                    log_info("Benchmark completed successfully");
-                    Ok(())
-                }
-                Err(e) => {
-                    log_error(&format!("Benchmark failed: {}", e));
-                    Err(e)
-                }
-            }
+            handle_benchmark_with_cache(
+                &url, requests, concurrency, connect_timeout, http3,
+                args.no_color, args.use_cache, args.no_save, args.profile
+            ).await
         }
 
         Commands::Config { action } => {
@@ -335,6 +333,380 @@ pub async fn execute() -> Result<()> {
 
         Commands::Profile { action } => {
             handle_profile_action(action, &mut config, &config_path).await
+        }
+
+        Commands::Cache { action } => {
+            handle_cache_action(action).await
+        }
+    }
+}
+
+async fn handle_get_request_with_cache(
+    url: &str,
+    include: bool,
+    output: Option<PathBuf>,
+    location: bool,
+    headers: Vec<String>,
+    connect_timeout: u64,
+    verbose: bool,
+    http3: bool,
+    json: bool,
+    analyze: bool,
+    save_history: bool,
+    config: &Config,
+    no_color: bool,
+    use_cache: bool,
+    no_save: bool,
+    profile: Option<String>,
+) -> Result<()> {
+    let cache_path = CachedConfig::get_cache_path();
+    let mut cached_config = CachedConfig::load_from_file(&cache_path)?;
+
+    if use_cache {
+        if cached_config.is_empty() {
+            eprintln!("Error: No cached configuration found. Please run a command without -x first to create a cache.");
+            return Ok(());
+        }
+
+        // 检查是否有用户提供的参数与缓存冲突
+        let provided_include = if include { Some(include) } else { None };
+        let provided_location = if location { Some(location) } else { None };
+        let provided_headers = if !headers.is_empty() { Some(headers.clone()) } else { None };
+        let provided_connect_timeout = Some(connect_timeout).filter(|&t| t != 10); // 10是默认值
+        let provided_verbose = if verbose { Some(verbose) } else { None };
+        let provided_http3 = if http3 { Some(http3) } else { None };
+        let provided_json = if json { Some(json) } else { None };
+        let provided_analyze = if analyze { Some(analyze) } else { None };
+        let provided_save_history = Some(save_history).filter(|&s| s != true); // true是默认值
+
+        let conflicts = cached_config.detect_conflicts_get(
+            provided_include,
+            provided_location,
+            &provided_headers,
+            provided_connect_timeout,
+            provided_verbose,
+            provided_http3,
+            provided_json,
+            provided_analyze,
+            provided_save_history,
+        );
+
+        if !conflicts.is_empty() {
+            eprintln!("Error: Configuration conflicts detected when using cache:");
+            for conflict in conflicts {
+                eprintln!("  - {}", conflict);
+            }
+            eprintln!("Please resolve conflicts or run without -x to override cache.");
+            return Ok(());
+        }
+
+        // 合并配置
+        let (merged_include, merged_location, merged_headers, merged_connect_timeout,
+            merged_verbose, merged_http3, merged_json, merged_analyze, merged_save_history) =
+            cached_config.merge_get_config(
+                provided_include,
+                provided_location,
+                provided_headers.clone(),
+                provided_connect_timeout,
+                provided_verbose,
+                provided_http3,
+                provided_json,
+                provided_analyze,
+                provided_save_history,
+            );
+
+        // 如果有新参数，更新并保存缓存
+        let has_new_params = provided_include.is_some() || provided_location.is_some() ||
+            provided_headers.is_some() || provided_connect_timeout.is_some() ||
+            provided_verbose.is_some() || provided_http3.is_some() ||
+            provided_json.is_some() || provided_analyze.is_some() ||
+            provided_save_history.is_some();
+
+        if has_new_params {
+            cached_config.update_with_get(
+                merged_include, merged_location, merged_headers.clone(), merged_connect_timeout,
+                merged_verbose, merged_http3, merged_json, merged_analyze, merged_save_history,
+                no_color, profile.clone()
+            );
+            cached_config.save_to_file(&cache_path)?;
+            log_info("Updated cache with new parameters");
+        }
+
+        log_info("Using cached configuration for GET request");
+        handle_get_request(
+            url, merged_include, output, merged_location, merged_headers, merged_connect_timeout,
+            merged_verbose, merged_http3, merged_json, merged_analyze, merged_save_history,
+            config, no_color
+        ).await
+    } else {
+        // 正常执行，不使用缓存
+        let result = handle_get_request(
+            url, include, output.clone(), location, headers.clone(), connect_timeout,
+            verbose, http3, json, analyze, save_history, config, no_color
+        ).await;
+
+        // 保存配置到缓存（除非禁用保存）
+        if !no_save && result.is_ok() {
+            cached_config.update_with_get(
+                include, location, headers, connect_timeout, verbose, http3,
+                json, analyze, save_history, no_color, profile
+            );
+            cached_config.save_to_file(&cache_path)?;
+            log_info("Configuration saved to cache");
+        }
+
+        result
+    }
+}
+
+async fn handle_download_with_cache(
+    url: &str,
+    output: PathBuf,
+    parallel: usize,
+    continue_download: bool,
+    idle_timeout: u64,
+    http3: bool,
+    no_color: bool,
+    use_cache: bool,
+    no_save: bool,
+    profile: Option<String>,
+) -> Result<()> {
+    let cache_path = CachedConfig::get_cache_path();
+    let mut cached_config = CachedConfig::load_from_file(&cache_path)?;
+
+    if use_cache {
+        if cached_config.is_empty() {
+            eprintln!("Error: No cached configuration found. Please run a command without -x first to create a cache.");
+            return Ok(());
+        }
+
+        // 检查冲突
+        let provided_parallel = Some(parallel).filter(|&p| p != 4); // 4是默认值
+        let provided_continue = if continue_download { Some(continue_download) } else { None };
+        let provided_idle_timeout = Some(idle_timeout).filter(|&t| t != 30); // 30是默认值
+        let provided_http3 = if http3 { Some(http3) } else { None };
+
+        let conflicts = cached_config.detect_conflicts_download(
+            provided_parallel,
+            provided_continue,
+            provided_idle_timeout,
+            provided_http3,
+        );
+
+        if !conflicts.is_empty() {
+            eprintln!("Error: Configuration conflicts detected when using cache:");
+            for conflict in conflicts {
+                eprintln!("  - {}", conflict);
+            }
+            eprintln!("Please resolve conflicts or run without -x to override cache.");
+            return Ok(());
+        }
+
+        // 合并配置
+        let (merged_parallel, merged_continue, merged_idle_timeout, merged_http3) =
+            cached_config.merge_download_config(
+                provided_parallel,
+                provided_continue,
+                provided_idle_timeout,
+                provided_http3,
+            );
+
+        // 如果有新参数，更新并保存缓存
+        let has_new_params = provided_parallel.is_some() || provided_continue.is_some() ||
+            provided_idle_timeout.is_some() || provided_http3.is_some();
+
+        if has_new_params {
+            cached_config.update_with_download(
+                merged_parallel, merged_continue, merged_idle_timeout, merged_http3,
+                no_color, profile.clone()
+            );
+            cached_config.save_to_file(&cache_path)?;
+            log_info("Updated cache with new parameters");
+        }
+
+        log_info("Using cached configuration for download");
+        log_info(&format!("Starting download from: {}", url));
+        log_debug(&format!("Download parameters - output: {}, parallel: {}, continue: {}, timeout: {}s, http3: {}",
+                           output.display(), merged_parallel, merged_continue, merged_idle_timeout, merged_http3));
+
+        match download_file(url, &output, merged_parallel, merged_continue, merged_idle_timeout, merged_http3).await {
+            Ok(_) => {
+                log_info("Download completed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(timeout_err) = e.downcast_ref::<TimeoutError>() {
+                    log_error(&format!("Download failed with timeout: {}", timeout_err));
+                    eprintln!("Download failed: {}", timeout_err);
+                } else {
+                    log_error(&format!("Download failed: {}", e));
+                    eprintln!("Download failed: {}", e);
+                }
+                Err(e)
+            }
+        }
+    } else {
+        // 正常执行
+        log_info(&format!("Starting download from: {}", url));
+        log_debug(&format!("Download parameters - output: {}, parallel: {}, continue: {}, timeout: {}s, http3: {}",
+                           output.display(), parallel, continue_download, idle_timeout, http3));
+
+        let result = match download_file(url, &output, parallel, continue_download, idle_timeout, http3).await {
+            Ok(_) => {
+                log_info("Download completed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(timeout_err) = e.downcast_ref::<TimeoutError>() {
+                    log_error(&format!("Download failed with timeout: {}", timeout_err));
+                    eprintln!("Download failed: {}", timeout_err);
+                } else {
+                    log_error(&format!("Download failed: {}", e));
+                    eprintln!("Download failed: {}", e);
+                }
+                Err(e)
+            }
+        };
+
+        // 保存配置到缓存
+        if !no_save && result.is_ok() {
+            cached_config.update_with_download(
+                parallel, continue_download, idle_timeout, http3, no_color, profile
+            );
+            cached_config.save_to_file(&cache_path)?;
+            log_info("Configuration saved to cache");
+        }
+
+        result
+    }
+}
+
+async fn handle_benchmark_with_cache(
+    url: &str,
+    requests: usize,
+    concurrency: usize,
+    connect_timeout: u64,
+    http3: bool,
+    no_color: bool,
+    use_cache: bool,
+    no_save: bool,
+    profile: Option<String>,
+) -> Result<()> {
+    let cache_path = CachedConfig::get_cache_path();
+    let mut cached_config = CachedConfig::load_from_file(&cache_path)?;
+
+    if use_cache {
+        if cached_config.is_empty() {
+            eprintln!("Error: No cached configuration found. Please run a command without -x first to create a cache.");
+            return Ok(());
+        }
+
+        // 检查冲突
+        let provided_requests = Some(requests).filter(|&r| r != 100); // 100是默认值
+        let provided_concurrency = Some(concurrency).filter(|&c| c != 10); // 10是默认值
+        let provided_connect_timeout = Some(connect_timeout).filter(|&t| t != 5); // 5是默认值
+        let provided_http3 = if http3 { Some(http3) } else { None };
+
+        let conflicts = cached_config.detect_conflicts_bench(
+            provided_requests,
+            provided_concurrency,
+            provided_connect_timeout,
+            provided_http3,
+        );
+
+        if !conflicts.is_empty() {
+            eprintln!("Error: Configuration conflicts detected when using cache:");
+            for conflict in conflicts {
+                eprintln!("  - {}", conflict);
+            }
+            eprintln!("Please resolve conflicts or run without -x to override cache.");
+            return Ok(());
+        }
+
+        // 合并配置
+        let (merged_requests, merged_concurrency, merged_connect_timeout, merged_http3) =
+            cached_config.merge_bench_config(
+                provided_requests,
+                provided_concurrency,
+                provided_connect_timeout,
+                provided_http3,
+            );
+
+        // 如果有新参数，更新并保存缓存
+        let has_new_params = provided_requests.is_some() || provided_concurrency.is_some() ||
+            provided_connect_timeout.is_some() || provided_http3.is_some();
+
+        if has_new_params {
+            cached_config.update_with_bench(
+                merged_requests, merged_concurrency, merged_connect_timeout, merged_http3,
+                no_color, profile.clone()
+            );
+            cached_config.save_to_file(&cache_path)?;
+            log_info("Updated cache with new parameters");
+        }
+
+        log_info("Using cached configuration for benchmark");
+        log_info(&format!("Starting benchmark for: {}", url));
+        log_debug(&format!("Benchmark parameters - requests: {}, concurrency: {}, timeout: {}s, http3: {}",
+                           merged_requests, merged_concurrency, merged_connect_timeout, merged_http3));
+
+        match benchmark_url(url, merged_requests, merged_concurrency, merged_connect_timeout, merged_http3).await {
+            Ok(_) => {
+                log_info("Benchmark completed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                log_error(&format!("Benchmark failed: {}", e));
+                Err(e)
+            }
+        }
+    } else {
+        // 正常执行
+        log_info(&format!("Starting benchmark for: {}", url));
+        log_debug(&format!("Benchmark parameters - requests: {}, concurrency: {}, timeout: {}s, http3: {}",
+                           requests, concurrency, connect_timeout, http3));
+
+        let result = match benchmark_url(url, requests, concurrency, connect_timeout, http3).await {
+            Ok(_) => {
+                log_info("Benchmark completed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                log_error(&format!("Benchmark failed: {}", e));
+                Err(e)
+            }
+        };
+
+        // 保存配置到缓存
+        if !no_save && result.is_ok() {
+            cached_config.update_with_bench(
+                requests, concurrency, connect_timeout, http3, no_color, profile
+            );
+            cached_config.save_to_file(&cache_path)?;
+            log_info("Configuration saved to cache");
+        }
+
+        result
+    }
+}
+
+async fn handle_cache_action(action: CacheAction) -> Result<()> {
+    let cache_path = CachedConfig::get_cache_path();
+
+    match action {
+        CacheAction::Show => {
+            let cached_config = CachedConfig::load_from_file(&cache_path)?;
+            println!("{}", cached_config.display_cached_config());
+            Ok(())
+        }
+        CacheAction::Clear => {
+            if cache_path.exists() {
+                std::fs::remove_file(&cache_path)?;
+                println!("Cached configuration cleared");
+            } else {
+                println!("No cached configuration found");
+            }
+            Ok(())
         }
     }
 }

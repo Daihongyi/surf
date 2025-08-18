@@ -14,8 +14,9 @@ Surf is a modern HTTP client with advanced features for developers and system ad
 - 👤 **Profile system** for managing different API environments
 - 🔍 **Response analysis** with security headers and performance insights
 - 🎨 **JSON formatting** with syntax highlighting
-- 🔒 Support for custom headers and authentication
-- 📄 Comprehensive logging system
+- 💾 **Configuration caching** for quick command reuse and automation
+- 🔐 Support for custom headers and authentication
+- 📝 Comprehensive logging system
 - 🌐 Experimental HTTP/3 support
 - 🔄 Automatic redirect following
 - 📈 Verbose output with performance metrics
@@ -55,6 +56,8 @@ Available for all commands:
 - `--log`: Enable logging to file
 - `--profile <NAME>`: Use a specific configuration profile
 - `--no-color`: Disable colored output
+- `-x`, `--use-cache`: Use cached configuration from last run
+- `--no-save`: Do not save configuration to cache
 
 ### Basic structure
 ```bash
@@ -87,11 +90,14 @@ surf get [OPTIONS] <URL>
 # Basic GET request
 surf get https://api.github.com/users/octocat
 
-# With headers, JSON formatting, and analysis
+# With headers, JSON formatting, and analysis (saves to cache)
 surf get -H "Accept: application/json" --json --analyze https://api.github.com/users/octocat
 
-# Using a profile for API development
-surf --profile dev get /users/me
+# Reuse previous configuration for different URL
+surf get https://api.github.com/users/torvalds -x
+
+# Using a profile for API development without saving to cache
+surf --profile dev get /users/me --no-save
 
 # Save to file with verbose output and logging
 surf --log get -o response.json -v https://api.example.com/data
@@ -112,11 +118,17 @@ surf download [OPTIONS] <URL> <OUTPUT>
 
 **Examples:**
 ```bash
-# Basic download
+# Basic download (configuration is cached)
 surf download https://example.com/file.zip output.zip
 
 # Resume interrupted download with 8 parallel connections
 surf download -c -p 8 https://example.com/large-file.iso output.iso
+
+# Use cached configuration for another download
+surf download https://cdn.example.com/another-file.tar.gz another-file.tar.gz -x
+
+# Download without saving configuration to cache
+surf download --no-save https://temp.com/temp.zip temp.zip -p 2
 
 # Download with logging enabled
 surf --log download https://cdn.example.com/software.tar.gz software.tar.gz
@@ -137,8 +149,14 @@ surf bench [OPTIONS] <URL>
 
 **Examples:**
 ```bash
-# Basic benchmark
+# Basic benchmark (saves configuration)
 surf bench https://api.example.com/health
+
+# Heavy load test with same settings as before
+surf bench https://api.example.com/endpoint -x
+
+# Override cached concurrency setting (will show conflict error)
+surf bench https://api.example.com/test -x -c 20
 
 # Heavy load test with detailed logging
 surf --log bench -n 1000 -c 50 https://api.example.com/endpoint
@@ -246,6 +264,95 @@ surf profile show dev
 surf profile delete old-config
 ```
 
+### 7. Cache Management (`cache`) - NEW 🔥
+Manage configuration caching for rapid command reuse and automation workflows.
+
+```bash
+surf cache <ACTION>
+```
+
+**Actions:**
+- `show`: Display current cached configuration
+- `clear`: Clear all cached configuration
+
+**Key Features:**
+- **Automatic Caching**: All successful command executions automatically save their configuration
+- **Smart Reuse**: Use `-x` to reuse the exact configuration from your last command
+- **Conflict Detection**: Prevents conflicting parameters when using cache
+- **Intelligent Merging**: Combines new parameters with cached ones when possible
+- **Selective Saving**: Use `--no-save` to prevent caching specific commands
+
+**Examples:**
+```bash
+# View current cached configuration
+surf cache show
+
+# Clear all cached settings
+surf cache clear
+
+# Example workflow:
+# 1. Run command with specific settings (automatically cached)
+surf download https://example.com/file1.zip file1.zip -p 8 --http3
+
+# 2. Reuse exact same settings for different file
+surf download https://example.com/file2.zip file2.zip -x
+
+# 3. Check what's cached
+surf cache show
+
+# 4. Clear cache when switching contexts
+surf cache clear
+```
+
+## Cache Usage Patterns
+
+### Basic Caching Workflow
+```bash
+# Step 1: Execute command with desired parameters (auto-cached)
+surf get -H "Authorization: Bearer token" --json --analyze https://api.example.com/users
+
+# Step 2: Reuse configuration for different endpoint
+surf get https://api.example.com/posts -x
+# Automatically uses: -H "Authorization: Bearer token" --json --analyze
+
+# Step 3: View cached configuration
+surf cache show
+```
+
+### Download Automation
+```bash
+# Set up download preferences
+surf download https://cdn.example.com/file1.tar.gz file1.tar.gz -p 8 -c --http3
+
+# Download multiple files with same settings
+surf download https://cdn.example.com/file2.tar.gz file2.tar.gz -x
+surf download https://cdn.example.com/file3.tar.gz file3.tar.gz -x
+```
+
+### Conflict Resolution
+```bash
+# First command caches parallel=4
+surf download https://example.com/file1.zip file1.zip -p 4
+
+# This will show conflict error because cached parallel=4 but provided parallel=8
+surf download https://example.com/file2.zip file2.zip -x -p 8
+# Error: Configuration conflicts detected when using cache:
+#   - parallel: cached=4, provided=8
+
+# Use without -x to override cache
+surf download https://example.com/file2.zip file2.zip -p 8
+```
+
+### Parameter Merging
+```bash
+# Cache basic settings
+surf get https://api.example.com/endpoint --json
+
+# Add new parameter to cached settings
+surf get https://api.example.com/other -x --analyze
+# Now cache contains both --json and --analyze
+```
+
 ## Output Examples
 
 ### Verbose GET request with analysis
@@ -309,21 +416,42 @@ Recent requests:
 2025-08-15 14:25:33 | GET https://slow-api.com/data | Error | N/A | i9j0k1l2
 ```
 
+### Cache configuration display
+```bash
+surf cache show
+```
+```
+Cached configuration:
+  parallel: 8
+  continue_download: true
+  idle_timeout: 30s
+  http3: true
+  include: true
+  verbose: true
+  json: true
+  analyze: true
+  headers: ["Authorization: Bearer token", "Accept: application/json"]
+  connect_timeout: 15s
+  no_color: false
+  profile: dev
+```
+
 ## Configuration Files
 
-### Config file location
+### Config file locations
 - **Global config**: `~/.config/surf/config.toml`
 - **History**: `~/.local/share/surf/history.json`
+- **Cache**: `~/.config/surf/last_config.json` ⭐ NEW
 - **Logs**: `./surf.log` (current directory) or alongside output files
 
 ### Sample config file
 ```toml
 default_timeout = 30
-default_user_agent = "surf/0.2.1"
+default_user_agent = "surf/0.3.0"
 max_redirects = 10
 
 [default_headers]
-"User-Agent" = "surf/0.2.1"
+"User-Agent" = "surf/0.3.0"
 "Accept" = "application/json"
 
 [profiles.dev]
@@ -339,41 +467,160 @@ timeout = 15
 follow_redirects = false
 ```
 
+### Sample cache file
+```json
+{
+  "parallel": 8,
+  "continue_download": true,
+  "idle_timeout": 30,
+  "http3": true,
+  "include": true,
+  "location": false,
+  "headers": [
+    "Authorization: Bearer token",
+    "Accept: application/json"
+  ],
+  "connect_timeout": 15,
+  "verbose": true,
+  "json": true,
+  "analyze": true,
+  "save_history": true,
+  "requests": 500,
+  "concurrency": 20,
+  "no_color": false,
+  "profile": "dev"
+}
+```
+
 ## Advanced Usage Examples
 
-### API Development Workflow
+### API Development Workflow with Caching
 ```bash
 # 1. Create API profiles for different environments
 surf profile create dev --base-url https://api-dev.company.com --follow-redirects
 surf profile create prod --base-url https://api.company.com --timeout 10
 
-# 2. Test API endpoints
-surf --profile dev get /health --analyze --json
+# 2. Test API endpoint with auth and caching
+surf --profile dev get /health --analyze --json -H "Authorization: Bearer dev-token"
 
-# 3. Run performance tests
-surf --profile dev bench /api/heavy-endpoint -n 100 -c 10
+# 3. Test multiple endpoints with same configuration
+surf --profile dev get /users -x
+surf --profile dev get /posts -x
+surf --profile dev get /settings -x
 
-# 4. Check request history
+# 4. Run performance tests with cached settings
+surf --profile dev bench /api/heavy-endpoint -x
+
+# 5. Check cache and history
+surf cache show
 surf history search "company.com"
 ```
 
-### Multi-environment Testing
+### Multi-environment Testing with Cache
 ```bash
-# Test the same endpoint across environments
+# Test dev environment (caches configuration)
+surf --profile dev get /health --json --analyze
+
+# Switch to prod (cache is preserved per environment)
+surf --profile prod get /health -x  # Uses cached settings for prod profile
+
+# Compare response times across environments
 for env in dev staging prod; do
   echo "Testing $env environment:"
-  surf --profile $env get /health --json | jq '.status'
+  surf --profile $env bench /health -x -n 50
 done
 ```
 
-### File Management with Logging
+### File Management Automation
 ```bash
-# Download with detailed logging for debugging
-surf --log download https://releases.company.com/v2.1/app.tar.gz ./downloads/app.tar.gz
+# Set up download preferences once
+surf download https://releases.company.com/v2.1/app.tar.gz ./downloads/app.tar.gz -p 8 --http3
+
+# Batch download with same settings
+for version in v2.2 v2.3 v2.4; do
+  surf download https://releases.company.com/$version/app.tar.gz ./downloads/app-$version.tar.gz -x
+done
 
 # Check download logs
 tail -f surf.log
 ```
+
+### CI/CD Integration Examples
+```bash
+#!/bin/bash
+# deployment-test.sh
+
+# Cache baseline testing configuration
+surf --profile staging bench /api/health -n 100 -c 10 --json
+
+# Test all critical endpoints with same configuration
+endpoints=("/api/users" "/api/posts" "/api/auth" "/api/upload")
+for endpoint in "${endpoints[@]}"; do
+  echo "Testing $endpoint..."
+  surf --profile staging bench "$endpoint" -x
+  if [ $? -ne 0 ]; then
+    echo "Benchmark failed for $endpoint"
+    exit 1
+  fi
+done
+
+echo "All benchmarks passed!"
+```
+
+### Development Workflow Optimization
+```bash
+# Morning routine: set up development session
+surf --profile dev get /api/auth/me -H "Authorization: Bearer $(cat ~/.dev-token)" --json --analyze
+
+# Throughout the day: quickly test different endpoints
+surf get /api/users/123 -x
+surf get /api/posts/latest -x  
+surf get /api/notifications -x
+
+# End of day: clear cache for fresh start tomorrow
+surf cache clear
+```
+
+## Cache Behavior Details
+
+### What Gets Cached
+- All command-line options and flags (except URLs and file paths)
+- Custom headers
+- Timeout settings
+- HTTP/3 preferences
+- Output formatting options (JSON, verbose, etc.)
+- Profile selections
+
+### What Doesn't Get Cached
+- URLs and endpoints
+- Output file paths
+- Temporary session data
+
+### Cache Lifecycle
+1. **Auto-save**: Every successful command execution saves its configuration
+2. **Conflict detection**: Using `-x` with conflicting parameters shows clear errors
+3. **Intelligent merging**: New parameters are merged with cached ones when possible
+4. **Manual management**: Use `surf cache show/clear` for inspection and cleanup
+
+### Default Values Reference
+
+| Command | Option | Default | Description |
+|---------|---------|---------|-------------|
+| download | parallel | 4 | Number of parallel connections |
+| download | continue_download | false | Resume interrupted downloads |
+| download | idle_timeout | 30 | Seconds between packets |
+| get | include | false | Show response headers |
+| get | location | false | Follow redirects |
+| get | connect_timeout | 10 | Connection timeout seconds |
+| get | verbose | false | Verbose output |
+| get | json | false | Pretty-print JSON |
+| get | analyze | false | Analyze response headers |
+| get | save_history | true | Save to request history |
+| bench | requests | 100 | Number of requests |
+| bench | concurrency | 10 | Concurrent connections |
+| bench | connect_timeout | 5 | Connection timeout seconds |
+| global | http3 | false | Use HTTP/3 protocol |
+| global | no_color | false | Disable colored output |
 
 ## Contributing
 
@@ -382,6 +629,14 @@ Contributions are welcome! Please follow these steps:
 2. Create a new branch for your feature
 3. Commit your changes with descriptive messages
 4. Push to your fork and submit a pull request
+
+### Recent Changes (v0.3.0)
+- ✨ Added configuration caching system
+- 🚀 Introduced `-x`/`--use-cache` for rapid command reuse
+- 🔧 Added `--no-save` option for selective caching
+- 📊 New `surf cache show/clear` commands
+- 🧠 Intelligent conflict detection and parameter merging
+- 📚 Enhanced automation capabilities for CI/CD workflows
 
 ## License
 
