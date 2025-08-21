@@ -14,7 +14,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(name = "surf", version = "0.3.5", about = "A modern HTTP client with advanced features")]
+#[command(name = "surf", version = "0.3.6", about = "A modern HTTP client with advanced features")]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
