@@ -17,6 +17,7 @@ dirs = "6.0.0"
 serde_json = "1.0.142"
 uuid = { version = "1.18.0" ,features = ["v4"]}
 colored = "3.0.0"
+thiserror = "1.0.69"
 
 [features]
 default = []
