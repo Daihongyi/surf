@@ -23,8 +23,8 @@ const PROGRESS_UPDATE_INTERVAL: usize = 1000; // 每1000个chunk更新一次日�
 
 #[derive(Debug, thiserror::Error)]
 pub enum TimeoutError {
-    #[error("Idle timeout: no data received")]
-    IdleTimeout,
+    #[error("Idle timeout: no data received for {0}s")]
+    IdleTimeout(u64),
     #[error("Connection timeout")]
     ConnectTimeout,
 }
@@ -293,39 +293,47 @@ async fn download_single(
     }
 
     let mut stream = response.bytes_stream();
-    let mut last_data_time = Instant::now();
     let idle_duration = Duration::from_secs(idle_timeout);
     let mut chunk_count = 0;
 
-    while let Some(item) = stream.next().await {
-        // 检查空闲超时
-        if last_data_time.elapsed() > idle_duration {
-            pb.set_message("\x1b[31mIDLE TIMEOUT\x1b[0m");
-            log_error("Download failed due to idle timeout");
-            return Err(anyhow!(TimeoutError::IdleTimeout));
+    // 关键修改: 使用 tokio::time::timeout 包装 stream.next()
+    loop {
+        match tokio::time::timeout(idle_duration, stream.next()).await {
+            Ok(Some(item)) => {
+                // 成功收到数据
+                let chunk = item.context("Error receiving chunk")?;
+                file.write_all(&chunk)
+                    .await
+                    .context("Error writing to file")?;
+
+                current_downloaded += chunk.len() as u64;
+                pb.set_position(current_downloaded);
+                chunk_count += 1;
+
+                // 定期记录进度
+                if chunk_count % PROGRESS_UPDATE_INTERVAL == 0 {
+                    log_debug(&format!("Downloaded {} bytes so far", current_downloaded));
+                }
+            }
+            Ok(None) => {
+                // 流结束
+                log_info(&format!(
+                    "Download stream completed, total chunks: {}",
+                    chunk_count
+                ));
+                break;
+            }
+            Err(_) => {
+                // 超时
+                pb.set_message("\x1b[31mIDLE TIMEOUT\x1b[0m");
+                log_error(&format!(
+                    "Download failed due to idle timeout ({}s with no data)",
+                    idle_timeout
+                ));
+                return Err(anyhow!(TimeoutError::IdleTimeout(idle_timeout)));
+            }
         }
-
-        let chunk = item.context("Error receiving chunk")?;
-        file.write_all(&chunk)
-            .await
-            .context("Error writing to file")?;
-
-        current_downloaded += chunk.len() as u64;
-        pb.set_position(current_downloaded);
-        chunk_count += 1;
-
-        // 定期记录进度
-        if chunk_count % PROGRESS_UPDATE_INTERVAL == 0 {
-            log_debug(&format!("Downloaded {} bytes so far", current_downloaded));
-        }
-
-        last_data_time = Instant::now();
     }
-
-    log_info(&format!(
-        "Download stream completed, total chunks: {}",
-        chunk_count
-    ));
 
     // 计算下载速度并完成进度条
     let elapsed_time = start_time.elapsed();
@@ -360,11 +368,22 @@ async fn download_parallel(
     parallel: usize,
     idle_timeout: u64,
 ) -> Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+
     let remaining = total_size - downloaded;
     if remaining == 0 {
         log_info("File already fully downloaded");
         return Ok(());
     }
+
+    // 预分配文件空间
+    let file = File::create(output).context("Failed to create output file")?;
+    file.set_len(total_size)
+        .context("Failed to pre-allocate file size")?;
+    let file = Arc::new(file);
 
     let chunk_size = remaining / parallel as u64;
     if chunk_size == 0 {
@@ -394,7 +413,7 @@ async fn download_parallel(
         let url = url.to_string();
         let semaphore = Arc::clone(&semaphore);
         let pb = Arc::clone(&pb);
-        let temp_path = output.with_extension(format!("part{}", i));
+        let file = Arc::clone(&file);
 
         let task = tokio::spawn(async move {
             let _permit = semaphore
@@ -410,38 +429,49 @@ async fn download_parallel(
                 .context("Failed to send range request")?;
 
             if response.status() != StatusCode::PARTIAL_CONTENT {
-                return Err(anyhow!("Server doesn't support range requests"));
+                return Err(anyhow!("Server doesn't support range requests, status: {}", response.status()));
             }
-
-            let mut file = fs::File::create(&temp_path)
-                .await
-                .context("Failed to create temp file")?;
 
             let mut stream = response.bytes_stream();
-            let mut bytes_written = 0u64;
+            let mut current_pos = start;
 
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.context("Error receiving chunk")?;
-                file.write_all(&chunk)
-                    .await
-                    .context("Error writing to temp file")?;
-                bytes_written += chunk.len() as u64;
-                pb.inc(chunk.len() as u64);
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result.context("Error receiving chunk")?;
+                let chunk_len = chunk.len();
+
+                let file_clone = Arc::clone(&file);
+                let current_chunk_pos = current_pos;
+
+                tokio::task::spawn_blocking(move || {
+                    #[cfg(unix)]
+                    {
+                        file_clone.write_at(&chunk, current_chunk_pos)?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // Fallback for non-unix platforms
+                        let mut f = &*file_clone;
+                        use std::io::{Seek, SeekFrom};
+                        f.seek(SeekFrom::Start(current_chunk_pos))?;
+                        f.write_all(&chunk)?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                }).await.context("Spawn blocking write failed")?.context("File write operation failed")?;
+
+                pb.inc(chunk_len as u64);
+                current_pos += chunk_len as u64;
             }
 
-            Ok::<(PathBuf, u64), anyhow::Error>((temp_path, bytes_written))
+            Ok::<(), anyhow::Error>(())
         });
 
         tasks.push(task);
     }
 
-    // 等待所有下载完成并收集临时文件
-    let mut temp_files = Vec::new();
+    // 等待所有下载完成
     for task in tasks {
         match task.await {
-            Ok(Ok((temp_path, _))) => {
-                temp_files.push(temp_path);
-            }
+            Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 log_error(&format!("Download task failed: {}", e));
                 return Err(e);
@@ -453,12 +483,12 @@ async fn download_parallel(
         }
     }
 
-    // 合并文件
-    pb.set_message("Merging files...");
-    merge_temp_files(output, &temp_files).await?;
-
     let elapsed = start_time.elapsed();
-    let speed = total_size as f64 / elapsed.as_secs_f64();
+    let speed = if elapsed.as_secs_f64() > 0.0 {
+        total_size as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
 
     pb.finish_with_message(format!(
         "Downloaded {} in {:.2}s (avg: {}/s)",
@@ -468,35 +498,6 @@ async fn download_parallel(
     ));
 
     log_info("Parallel download completed successfully");
-    Ok(())
-}
-
-async fn merge_temp_files(output: &PathBuf, temp_files: &[PathBuf]) -> Result<()> {
-    let mut final_file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(output)
-        .await
-        .context("Failed to create final output file")?;
-
-    for temp_file in temp_files {
-        let mut temp = fs::File::open(temp_file)
-            .await
-            .with_context(|| format!("Failed to open temp file: {}", temp_file.display()))?;
-
-        tokio::io::copy(&mut temp, &mut final_file)
-            .await
-            .with_context(|| format!("Failed to copy from temp file: {}", temp_file.display()))?;
-    }
-
-    // 清理临时文件
-    for temp_file in temp_files {
-        if let Err(e) = fs::remove_file(temp_file).await {
-            log_warn(&format!("Failed to remove temp file {}: {}", temp_file.display(), e));
-        }
-    }
-
     Ok(())
 }
 
@@ -524,7 +525,7 @@ pub async fn benchmark_url(
     let mut tasks = Vec::new();
 
     // 使用更高效的数据结构收集统计信息
-    let stats = Arc::new(tokio::sync::Mutex::new(BenchmarkStats::new()));
+    let stats = Arc::new(BenchmarkStats::new());
 
     for i in 0..requests {
         let client = client.clone();
@@ -544,8 +545,7 @@ pub async fn benchmark_url(
                 Err(_) => None,
             };
 
-            let mut stats_guard = stats.lock().await;
-            stats_guard.record_request(duration, status_code);
+            stats.record_request(duration, status_code).await;
 
             Ok::<(), anyhow::Error>(())
         });
@@ -565,66 +565,72 @@ pub async fn benchmark_url(
     }
 
     let total_time = start.elapsed();
-    let stats = stats.lock().await;
-    stats.print_results(requests, total_time);
+    stats.print_results(requests, total_time).await;
 
     log_info(&format!(
         "Benchmark completed - Total: {:.2}s, RPS: {:.2}, Success: {}, Failed: {}",
         total_time.as_secs_f64(),
         requests as f64 / total_time.as_secs_f64(),
-        stats.successful_requests,
-        stats.failed_requests
+        stats.successful_requests.load(std::sync::atomic::Ordering::Relaxed),
+        stats.failed_requests.load(std::sync::atomic::Ordering::Relaxed)
     ));
 
     Ok(())
 }
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use tokio::sync::Mutex;
+
 // 基准测试统计数据结构
 struct BenchmarkStats {
-    response_times: Vec<u64>,
-    status_codes: std::collections::HashMap<u16, u32>,
-    successful_requests: u32,
-    failed_requests: u32,
+    response_times: Arc<Mutex<Vec<u64>>>,
+    status_codes: Arc<Mutex<std::collections::HashMap<u16, u32>>>,
+    successful_requests: AtomicU32,
+    failed_requests: AtomicU32,
 }
 
 impl BenchmarkStats {
     fn new() -> Self {
         Self {
-            response_times: Vec::new(),
-            status_codes: std::collections::HashMap::new(),
-            successful_requests: 0,
-            failed_requests: 0,
+            response_times: Arc::new(Mutex::new(Vec::new())),
+            status_codes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            successful_requests: AtomicU32::new(0),
+            failed_requests: AtomicU32::new(0),
         }
     }
 
-    fn record_request(&mut self, duration: Duration, status_code: Option<u16>) {
+    async fn record_request(&self, duration: Duration, status_code: Option<u16>) {
         let ms = duration.as_millis() as u64;
-        self.response_times.push(ms);
+        self.response_times.lock().await.push(ms);
 
         if let Some(code) = status_code {
-            *self.status_codes.entry(code).or_insert(0) += 1;
+            *self.status_codes.lock().await.entry(code).or_insert(0) += 1;
 
-            if code >= 200 && code < 400 {
-                self.successful_requests += 1;
+            if (200..400).contains(&code) {
+                self.successful_requests.fetch_add(1, Ordering::Relaxed);
             } else {
-                self.failed_requests += 1;
+                self.failed_requests.fetch_add(1, Ordering::Relaxed);
                 log_warn(&format!("Request failed with status: {}", code));
             }
         } else {
-            self.failed_requests += 1;
+            self.failed_requests.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    fn print_results(&self, total_requests: usize, total_time: Duration) {
+    async fn print_results(&self, total_requests: usize, total_time: Duration) {
         let rps = total_requests as f64 / total_time.as_secs_f64();
 
         // 计算百分位数
-        let mut sorted_times = self.response_times.clone();
+        let mut sorted_times = self.response_times.lock().await.clone();
         sorted_times.sort_unstable();
 
         let min_time = sorted_times.first().copied().unwrap_or(0);
         let max_time = sorted_times.last().copied().unwrap_or(0);
-        let avg_time = sorted_times.iter().sum::<u64>() / sorted_times.len() as u64;
+        let avg_time = if !sorted_times.is_empty() {
+            sorted_times.iter().sum::<u64>() / sorted_times.len() as u64
+        } else {
+            0
+        };
 
         let p50 = percentile(&sorted_times, 0.5);
         let p95 = percentile(&sorted_times, 0.95);
@@ -633,8 +639,8 @@ impl BenchmarkStats {
         println!("\n=== Benchmark Results ===");
         println!("Total time: {:.2}s", total_time.as_secs_f64());
         println!("Requests per second: {:.2}", rps);
-        println!("Successful requests: {}", self.successful_requests);
-        println!("Failed requests: {}", self.failed_requests);
+        println!("Successful requests: {}", self.successful_requests.load(Ordering::Relaxed));
+        println!("Failed requests: {}", self.failed_requests.load(Ordering::Relaxed));
         println!();
         println!("Response Times (ms):");
         println!("  Min: {}", min_time);
@@ -646,7 +652,7 @@ impl BenchmarkStats {
         println!();
         println!("Status Code Distribution:");
 
-        for (status, count) in &self.status_codes {
+        for (status, count) in &*self.status_codes.lock().await {
             println!(
                 "  {}: {} ({:.1}%)",
                 status,

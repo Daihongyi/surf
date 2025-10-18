@@ -19,6 +19,10 @@ uuid = { version = "1.18.0" ,features = ["v4"]}
 colored = "3.0.0"
 thiserror = "1.0.69"
 
+# FTP support
+suppaftp = "4.1.0"
+url = "2.5.0"
+
 [features]
 default = []
 http3 = ["reqwest/http3"]
