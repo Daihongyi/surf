@@ -5,6 +5,7 @@ mod config;
 mod history;
 mod response;
 mod cache;
+mod game;
 
 use anyhow::Result;
 

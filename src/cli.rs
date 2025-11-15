@@ -14,7 +14,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(name = "surf", version = "0.3.7", about = "A modern HTTP client like curl with advanced features")]
+#[command(name = "surf", version = "0.3.8", about = "A modern HTTP client like curl with advanced features")]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -42,6 +42,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Play a hidden snake game (Easter egg! 🎮)
+    Play,
+
     /// Fetch a URL and display the response
     Get {
         /// URL to fetch
@@ -276,6 +279,14 @@ pub async fn execute() -> Result<()> {
     }
 
     match args.command {
+        Commands::Play => {
+            // 隐藏的彩蛋游戏
+            println!("\n Welcome to SURF Snake Game!");
+            println!("Get ready to play...\n");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            crate::game::run_game().await
+        }
+
         Commands::Get {
             url,
             include,
@@ -341,6 +352,7 @@ pub async fn execute() -> Result<()> {
     }
 }
 
+// ... 其余的函数保持不变 ...
 async fn handle_get_request_with_cache(
     url: &str,
     include: bool,
@@ -415,7 +427,7 @@ async fn handle_get_request_with_cache(
                 provided_save_history,
             );
 
-        // 如果有新参数，更新并保存缓存
+        // 如果有新参数,更新并保存缓存
         let has_new_params = provided_include.is_some() || provided_location.is_some() ||
             provided_headers.is_some() || provided_connect_timeout.is_some() ||
             provided_verbose.is_some() || provided_http3.is_some() ||
@@ -439,13 +451,13 @@ async fn handle_get_request_with_cache(
             config, no_color
         ).await
     } else {
-        // 正常执行，不使用缓存
+        // 正常执行,不使用缓存
         let result = handle_get_request(
             url, include, output.clone(), location, headers.clone(), connect_timeout,
             verbose, http3, json, analyze, save_history, config, no_color
         ).await;
 
-        // 保存配置到缓存（除非禁用保存）
+        // 保存配置到缓存(除非禁用保存)
         if !no_save && result.is_ok() {
             cached_config.update_with_get(
                 include, location, headers, connect_timeout, verbose, http3,
@@ -511,7 +523,7 @@ async fn handle_download_with_cache(
                 provided_http3,
             );
 
-        // 如果有新参数，更新并保存缓存
+        // 如果有新参数,更新并保存缓存
         let has_new_params = provided_parallel.is_some() || provided_continue.is_some() ||
             provided_idle_timeout.is_some() || provided_http3.is_some();
 
@@ -632,7 +644,7 @@ async fn handle_benchmark_with_cache(
                 provided_http3,
             );
 
-        // 如果有新参数，更新并保存缓存
+        // 如果有新参数,更新并保存缓存
         let has_new_params = provided_requests.is_some() || provided_concurrency.is_some() ||
             provided_connect_timeout.is_some() || provided_http3.is_some();
 
