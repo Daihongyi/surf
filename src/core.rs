@@ -19,7 +19,7 @@ use tokio::{fs, io::AsyncWriteExt, sync::Semaphore};
 const DEFAULT_CONNECT_TIMEOUT: u64 = 10;
 const PARALLEL_DOWNLOAD_THRESHOLD: u64 = 10_000_000; // 10MB
 const MAX_REDIRECTS: usize = 10;
-const PROGRESS_UPDATE_INTERVAL: usize = 1000; // 每1000个chunk更新一次日志
+const PROGRESS_UPDATE_INTERVAL: usize = 1000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TimeoutError {
@@ -29,7 +29,6 @@ pub enum TimeoutError {
     ConnectTimeout,
 }
 
-// 辅助函数：解析header字符串
 fn parse_header(header_str: &str) -> Result<(HeaderName, HeaderValue)> {
     let (key, value) = header_str
         .split_once(':')
@@ -44,7 +43,6 @@ fn parse_header(header_str: &str) -> Result<(HeaderName, HeaderValue)> {
     Ok((header_name, header_value))
 }
 
-// 辅助函数：创建进度条
 fn create_progress_bar(total_size: u64, initial_pos: u64) -> ProgressBar {
     let pb = ProgressBar::new(total_size);
     pb.set_style(
@@ -70,28 +68,18 @@ pub fn build_client(
 
     let mut client_builder = ClientBuilder::new();
 
-    // 设置重定向策略
     let redirect_policy = if follow_redirects {
         Policy::limited(MAX_REDIRECTS)
     } else {
         Policy::none()
     };
     client_builder = client_builder.redirect(redirect_policy);
-    log_debug(&format!(
-        "Redirect policy set: {}",
-        if follow_redirects {
-            "limited(10)"
-        } else {
-            "none"
-        }
-    ));
 
-    // 设置连接和请求超时
+    // 关键修改：增加请求超时时间，避免在大文件下载时过早超时
     client_builder = client_builder
         .connect_timeout(Duration::from_secs(connect_timeout))
-        .timeout(Duration::from_secs(connect_timeout * 3));
+        .timeout(Duration::from_secs(300)); // 增加到5分钟，避免大文件下载时超时
 
-    // 添加自定义headers
     let mut header_map = HeaderMap::new();
     for header in headers {
         match parse_header(&header) {
@@ -106,7 +94,6 @@ pub fn build_client(
     }
     client_builder = client_builder.default_headers(header_map);
 
-    // HTTP/3支持
     if http3 {
         #[cfg(not(feature = "http3"))]
         {
@@ -148,7 +135,6 @@ pub async fn download_file(
 
     let client = build_client(true, DEFAULT_CONNECT_TIMEOUT, http3, vec![])?;
 
-    // 获取文件信息和检查范围请求支持
     let (total_size, supports_range) = get_download_info(&client, url).await?;
 
     log_info(&format!(
@@ -161,7 +147,6 @@ pub async fn download_file(
     ));
     log_debug(&format!("Range requests supported: {}", supports_range));
 
-    // 检查是否可以恢复下载
     let downloaded = if continue_download && output.exists() {
         let metadata = fs::metadata(output).await?;
         metadata.len()
@@ -176,7 +161,6 @@ pub async fn download_file(
         ));
     }
 
-    // 决定使用并行还是单连接下载
     let use_parallel = supports_range
         && total_size > 0
         && parallel > 1
@@ -296,11 +280,9 @@ async fn download_single(
     let idle_duration = Duration::from_secs(idle_timeout);
     let mut chunk_count = 0;
 
-    // 关键修改: 使用 tokio::time::timeout 包装 stream.next()
     loop {
         match tokio::time::timeout(idle_duration, stream.next()).await {
             Ok(Some(item)) => {
-                // 成功收到数据
                 let chunk = item.context("Error receiving chunk")?;
                 file.write_all(&chunk)
                     .await
@@ -310,13 +292,11 @@ async fn download_single(
                 pb.set_position(current_downloaded);
                 chunk_count += 1;
 
-                // 定期记录进度
                 if chunk_count % PROGRESS_UPDATE_INTERVAL == 0 {
                     log_debug(&format!("Downloaded {} bytes so far", current_downloaded));
                 }
             }
             Ok(None) => {
-                // 流结束
                 log_info(&format!(
                     "Download stream completed, total chunks: {}",
                     chunk_count
@@ -324,7 +304,6 @@ async fn download_single(
                 break;
             }
             Err(_) => {
-                // 超时
                 pb.set_message("\x1b[31mIDLE TIMEOUT\x1b[0m");
                 log_error(&format!(
                     "Download failed due to idle timeout ({}s with no data)",
@@ -335,7 +314,6 @@ async fn download_single(
         }
     }
 
-    // 计算下载速度并完成进度条
     let elapsed_time = start_time.elapsed();
     let download_size = current_downloaded - initial_downloaded;
     let avg_speed = if elapsed_time.as_secs_f64() > 0.0 {
@@ -379,7 +357,6 @@ async fn download_parallel(
         return Ok(());
     }
 
-    // 预分配文件空间
     let file = File::create(output).context("Failed to create output file")?;
     file.set_len(total_size)
         .context("Failed to pre-allocate file size")?;
@@ -435,31 +412,45 @@ async fn download_parallel(
             let mut stream = response.bytes_stream();
             let mut current_pos = start;
 
-            while let Some(chunk_result) = stream.next().await {
-                let chunk = chunk_result.context("Error receiving chunk")?;
-                let chunk_len = chunk.len();
+            // 关键修改：在并行下载中也添加空闲超时检测
+            let idle_duration = Duration::from_secs(idle_timeout);
 
-                let file_clone = Arc::clone(&file);
-                let current_chunk_pos = current_pos;
+            loop {
+                match tokio::time::timeout(idle_duration, stream.next()).await {
+                    Ok(Some(chunk_result)) => {
+                        let chunk = chunk_result.context("Error receiving chunk")?;
+                        let chunk_len = chunk.len();
 
-                tokio::task::spawn_blocking(move || {
-                    #[cfg(unix)]
-                    {
-                        file_clone.write_at(&chunk, current_chunk_pos)?;
+                        let file_clone = Arc::clone(&file);
+                        let current_chunk_pos = current_pos;
+
+                        tokio::task::spawn_blocking(move || {
+                            #[cfg(unix)]
+                            {
+                                file_clone.write_at(&chunk, current_chunk_pos)?;
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                let mut f = &*file_clone;
+                                use std::io::{Seek, SeekFrom};
+                                f.seek(SeekFrom::Start(current_chunk_pos))?;
+                                f.write_all(&chunk)?;
+                            }
+                            Ok::<(), std::io::Error>(())
+                        }).await.context("Spawn blocking write failed")?.context("File write operation failed")?;
+
+                        pb.inc(chunk_len as u64);
+                        current_pos += chunk_len as u64;
                     }
-                    #[cfg(not(unix))]
-                    {
-                        // Fallback for non-unix platforms
-                        let mut f = &*file_clone;
-                        use std::io::{Seek, SeekFrom};
-                        f.seek(SeekFrom::Start(current_chunk_pos))?;
-                        f.write_all(&chunk)?;
+                    Ok(None) => {
+                        // 流结束，正常退出
+                        break;
                     }
-                    Ok::<(), std::io::Error>(())
-                }).await.context("Spawn blocking write failed")?.context("File write operation failed")?;
-
-                pb.inc(chunk_len as u64);
-                current_pos += chunk_len as u64;
+                    Err(_) => {
+                        // 空闲超时
+                        return Err(anyhow!(TimeoutError::IdleTimeout(idle_timeout)));
+                    }
+                }
             }
 
             Ok::<(), anyhow::Error>(())
@@ -469,15 +460,19 @@ async fn download_parallel(
     }
 
     // 等待所有下载完成
-    for task in tasks {
+    for (i, task) in tasks.into_iter().enumerate() {
         match task.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                log_debug(&format!("Task {} completed successfully", i));
+            }
             Ok(Err(e)) => {
-                log_error(&format!("Download task failed: {}", e));
+                log_error(&format!("Download task {} failed: {}", i, e));
+                pb.abandon_with_message(format!("Task {} failed: {}", i, e));
                 return Err(e);
             }
             Err(e) => {
-                log_error(&format!("Download task panicked: {}", e));
+                log_error(&format!("Download task {} panicked: {}", i, e));
+                pb.abandon_with_message(format!("Task {} panicked", i));
                 return Err(anyhow!("Download task panicked: {}", e));
             }
         }
@@ -524,7 +519,6 @@ pub async fn benchmark_url(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::new();
 
-    // 使用更高效的数据结构收集统计信息
     let stats = Arc::new(BenchmarkStats::new());
 
     for i in 0..requests {
@@ -557,7 +551,6 @@ pub async fn benchmark_url(
         }
     }
 
-    // 等待所有任务完成
     for task in tasks {
         if let Err(e) = task.await? {
             log_warn(&format!("Benchmark task failed: {}", e));
@@ -581,7 +574,6 @@ pub async fn benchmark_url(
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::Mutex;
 
-// 基准测试统计数据结构
 struct BenchmarkStats {
     response_times: Arc<Mutex<Vec<u64>>>,
     status_codes: Arc<Mutex<std::collections::HashMap<u16, u32>>>,
@@ -620,7 +612,6 @@ impl BenchmarkStats {
     async fn print_results(&self, total_requests: usize, total_time: Duration) {
         let rps = total_requests as f64 / total_time.as_secs_f64();
 
-        // 计算百分位数
         let mut sorted_times = self.response_times.lock().await.clone();
         sorted_times.sort_unstable();
 
@@ -663,7 +654,6 @@ impl BenchmarkStats {
     }
 }
 
-// 计算百分位数的辅助函数
 fn percentile(sorted_data: &[u64], percentile: f64) -> u64 {
     if sorted_data.is_empty() {
         return 0;

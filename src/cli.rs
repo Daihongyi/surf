@@ -14,7 +14,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(name = "surf", version = "0.3.8", about = "A modern HTTP client like curl with advanced features")]
+#[command(name = "surf", version = "0.4.0", about = "A modern HTTP client like curl with advanced features")]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -239,7 +239,7 @@ enum CacheAction {
 }
 
 pub async fn execute() -> Result<()> {
-    let args = Cli::parse();
+    let args = <Cli as Parser>::parse();
 
     // Load configuration
     let config_path = Config::get_config_path();
