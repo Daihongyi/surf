@@ -21,6 +21,14 @@ const PARALLEL_DOWNLOAD_THRESHOLD: u64 = 10_000_000; // 10MB
 const MAX_REDIRECTS: usize = 10;
 const PROGRESS_UPDATE_INTERVAL: usize = 1000;
 
+// 新增：客户端类型枚举，用于区分不同场景的超时策略
+#[derive(Debug, Clone, Copy)]
+pub enum ClientType {
+    Get,       // GET 请求：需要总超时限制
+    Download,  // 下载：只依赖空闲超时，无总超时限制
+    Benchmark, // 基准测试：需要较短的总超时
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TimeoutError {
     #[error("Idle timeout: no data received for {0}s")]
@@ -55,15 +63,17 @@ fn create_progress_bar(total_size: u64, initial_pos: u64) -> ProgressBar {
     pb
 }
 
+// 修改后的 build_client 函数：根据客户端类型设置不同的超时策略
 pub fn build_client(
     follow_redirects: bool,
     connect_timeout: u64,
     http3: bool,
     headers: Vec<String>,
+    client_type: ClientType, // 新增参数
 ) -> Result<Client> {
     log_debug(&format!(
-        "Building HTTP client - redirects: {}, timeout: {}s, http3: {}",
-        follow_redirects, connect_timeout, http3
+        "Building HTTP client - type: {:?}, redirects: {}, timeout: {}s, http3: {}",
+        client_type, follow_redirects, connect_timeout, http3
     ));
 
     let mut client_builder = ClientBuilder::new();
@@ -75,10 +85,26 @@ pub fn build_client(
     };
     client_builder = client_builder.redirect(redirect_policy);
 
-    // 关键修改：增加请求超时时间，避免在大文件下载时过早超时
-    client_builder = client_builder
-        .connect_timeout(Duration::from_secs(connect_timeout))
-        .timeout(Duration::from_secs(300)); // 增加到5分钟，避免大文件下载时超时
+    // 关键修改：根据客户端类型设置不同的超时策略
+    client_builder = client_builder.connect_timeout(Duration::from_secs(connect_timeout));
+
+    match client_type {
+        ClientType::Get => {
+            // GET 请求：设置合理的总超时（5分钟）
+            client_builder = client_builder.timeout(Duration::from_secs(300));
+            log_debug("Client configured with 300s total timeout for GET requests");
+        }
+        ClientType::Download => {
+            // 下载：不设置总超时，完全依赖空闲超时来判断连接是否断开
+            // 这样即使下载大文件超过5分钟也不会超时
+            log_debug("Client configured WITHOUT total timeout for downloads (idle timeout only)");
+        }
+        ClientType::Benchmark => {
+            // 基准测试：设置较短的总超时（60秒）
+            client_builder = client_builder.timeout(Duration::from_secs(60));
+            log_debug("Client configured with 60s total timeout for benchmarks");
+        }
+    }
 
     let mut header_map = HeaderMap::new();
     for header in headers {
@@ -133,7 +159,8 @@ pub async fn download_file(
         idle_timeout
     ));
 
-    let client = build_client(true, DEFAULT_CONNECT_TIMEOUT, http3, vec![])?;
+    // 关键修改：使用 ClientType::Download，不设置总超时
+    let client = build_client(true, DEFAULT_CONNECT_TIMEOUT, http3, vec![], ClientType::Download)?;
 
     let (total_size, supports_range) = get_download_info(&client, url).await?;
 
@@ -279,6 +306,12 @@ async fn download_single(
     let mut stream = response.bytes_stream();
     let idle_duration = Duration::from_secs(idle_timeout);
     let mut chunk_count = 0;
+    let mut last_progress_log = Instant::now();
+
+    log_info(&format!(
+        "Download started with idle timeout of {}s (no total timeout limit)",
+        idle_timeout
+    ));
 
     loop {
         match tokio::time::timeout(idle_duration, stream.next()).await {
@@ -292,22 +325,32 @@ async fn download_single(
                 pb.set_position(current_downloaded);
                 chunk_count += 1;
 
-                if chunk_count % PROGRESS_UPDATE_INTERVAL == 0 {
-                    log_debug(&format!("Downloaded {} bytes so far", current_downloaded));
+                // 定期记录进度日志
+                if last_progress_log.elapsed() >= Duration::from_secs(10) {
+                    log_debug(&format!(
+                        "Download progress: {} / {} ({:.1}%), elapsed: {:.1}s",
+                        HumanBytes(current_downloaded),
+                        HumanBytes(total_size),
+                        (current_downloaded as f64 / total_size as f64) * 100.0,
+                        start_time.elapsed().as_secs_f64()
+                    ));
+                    last_progress_log = Instant::now();
                 }
             }
             Ok(None) => {
                 log_info(&format!(
-                    "Download stream completed, total chunks: {}",
-                    chunk_count
+                    "Download stream completed, total chunks: {}, total time: {:.2}s",
+                    chunk_count,
+                    start_time.elapsed().as_secs_f64()
                 ));
                 break;
             }
             Err(_) => {
                 pb.set_message("\x1b[31mIDLE TIMEOUT\x1b[0m");
                 log_error(&format!(
-                    "Download failed due to idle timeout ({}s with no data)",
-                    idle_timeout
+                    "Download failed due to idle timeout ({}s with no data) after {:.2}s total time",
+                    idle_timeout,
+                    start_time.elapsed().as_secs_f64()
                 ));
                 return Err(anyhow!(TimeoutError::IdleTimeout(idle_timeout)));
             }
@@ -368,9 +411,10 @@ async fn download_parallel(
     }
 
     log_info(&format!(
-        "Parallel download: {} chunks of ~{} bytes each",
+        "Parallel download: {} chunks of ~{} bytes each (idle timeout: {}s, no total timeout)",
         parallel,
-        HumanBytes(chunk_size)
+        HumanBytes(chunk_size),
+        idle_timeout
     ));
 
     let pb = Arc::new(create_progress_bar(total_size, downloaded));
@@ -412,7 +456,6 @@ async fn download_parallel(
             let mut stream = response.bytes_stream();
             let mut current_pos = start;
 
-            // 关键修改：在并行下载中也添加空闲超时检测
             let idle_duration = Duration::from_secs(idle_timeout);
 
             loop {
@@ -443,11 +486,9 @@ async fn download_parallel(
                         current_pos += chunk_len as u64;
                     }
                     Ok(None) => {
-                        // 流结束，正常退出
                         break;
                     }
                     Err(_) => {
-                        // 空闲超时
                         return Err(anyhow!(TimeoutError::IdleTimeout(idle_timeout)));
                     }
                 }
@@ -459,7 +500,6 @@ async fn download_parallel(
         tasks.push(task);
     }
 
-    // 等待所有下载完成
     for (i, task) in tasks.into_iter().enumerate() {
         match task.await {
             Ok(Ok(())) => {
@@ -492,7 +532,10 @@ async fn download_parallel(
         HumanBytes(speed as u64)
     ));
 
-    log_info("Parallel download completed successfully");
+    log_info(&format!(
+        "Parallel download completed successfully in {:.2}s",
+        elapsed.as_secs_f64()
+    ));
     Ok(())
 }
 
@@ -508,7 +551,8 @@ pub async fn benchmark_url(
         url, requests, concurrency
     ));
 
-    let client = build_client(true, connect_timeout, http3, vec![])?;
+    // 关键修改：使用 ClientType::Benchmark，设置60秒总超时
+    let client = build_client(true, connect_timeout, http3, vec![], ClientType::Benchmark)?;
 
     println!(
         "Benchmarking {} with {} requests, concurrency {} (HTTP/3: {})",

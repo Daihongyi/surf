@@ -4,6 +4,7 @@ use crate::config::{Config, Profile};
 use crate::history::{RequestHistory, HistoryEntry};
 use crate::response::{ResponseFormatter, ResponseAnalyzer};
 use crate::cache::CachedConfig;
+use crate::core::ClientType;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::{
@@ -14,7 +15,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(name = "surf", version = "0.4.0", about = "A modern HTTP client like curl with advanced features")]
+#[command(name = "surf", version = "0.4.0-A", about = "A modern HTTP client like curl with advanced features,build with rust")]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -723,6 +724,9 @@ async fn handle_cache_action(action: CacheAction) -> Result<()> {
     }
 }
 
+
+// ... 其他代码保持不变 ...
+
 async fn handle_get_request(
     url: &str,
     include: bool,
@@ -770,9 +774,10 @@ async fn handle_get_request(
         None
     };
 
-    let client = match build_client(location, connect_timeout, http3, header_vec) {
+    // 关键修改：传入 ClientType::Get
+    let client = match build_client(location, connect_timeout, http3, header_vec, ClientType::Get) {
         Ok(client) => {
-            log_debug("HTTP client built successfully");
+            log_debug("HTTP client built successfully for GET request (300s total timeout)");
             client
         }
         Err(e) => {
