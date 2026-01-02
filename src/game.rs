@@ -264,8 +264,8 @@ pub async fn run_game() -> Result<()> {
     terminal.show_cursor()?;
 
     println!("\n🎮 Game Over! Final Score: {}", game.score);
-    if game.score >= 100 {
-        println!("I am Ayin, I love LCX");
+    if game.score >= 500 {
+        println!("I am Ayin, I love HYX");
     }
     println!("Thanks for playing!\n");
 
