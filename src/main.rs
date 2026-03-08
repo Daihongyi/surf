@@ -1,3 +1,4 @@
+// src/main.rs
 mod cli;
 mod core;
 mod log;
@@ -6,6 +7,8 @@ mod history;
 mod response;
 mod cache;
 mod game;
+mod resume;
+
 
 use anyhow::Result;
 
