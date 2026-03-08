@@ -1,11 +1,12 @@
-use crate::core::{benchmark_url, build_client, download_file, TimeoutError};
+use crate::core::{benchmark_url, build_client, download_file, TimeoutError, ClientType};
 use crate::log::{init_logger, log_info, log_error, log_debug, log_warn};
 use crate::config::{Config, Profile};
 use crate::history::{RequestHistory, HistoryEntry};
 use crate::response::{ResponseFormatter, ResponseAnalyzer};
 use crate::cache::CachedConfig;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
+use indicatif::HumanBytes;
 use std::{
     collections::HashMap,
     io::Write,
@@ -14,7 +15,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(name = "surf", version = "0.3.6", about = "A modern HTTP client with advanced features")]
+#[command(name = "surf", version = "0.4.1-A", about = "A modern HTTP client like curl with advanced features,build with rust")]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -42,6 +43,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Play a hidden snake game (Easter egg! 🎮)
+    Play,
     /// Fetch a URL and display the response
     Get {
         /// URL to fetch
@@ -158,6 +161,12 @@ enum Commands {
         #[command(subcommand)]
         action: CacheAction,
     },
+
+    /// Resume/download management
+    Resume {
+        #[command(subcommand)]
+        action: ResumeAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -235,9 +244,38 @@ enum CacheAction {
     Clear,
 }
 
+#[derive(Subcommand)]
+enum ResumeAction {
+    /// List all resumable downloads
+    List,
+    /// Show details of a specific download
+    Show {
+        /// URL or hash of the download
+        url_or_hash: String,
+    },
+    /// Resume a specific download
+    Resume {
+        /// URL of the download to resume
+        url: String,
+        /// Output file path (optional, uses original if not specified)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
+    /// Clean up old download metadata
+    Cleanup {
+        /// Number of days (default: 7)
+        #[arg(short = 'd', long, default_value = "7")]
+        days: u64,
+    },
+    /// Delete a specific download's metadata
+    Delete {
+        /// URL or hash of the download
+        url_or_hash: String,
+    },
+}
+
 pub async fn execute() -> Result<()> {
     let args = Cli::parse();
-
     // Load configuration
     let config_path = Config::get_config_path();
     let mut config = Config::load_from_file(&config_path)?;
@@ -276,6 +314,14 @@ pub async fn execute() -> Result<()> {
     }
 
     match args.command {
+        Commands::Play => {
+            // 隐藏的彩蛋游戏
+            println!("\n🎮 Welcome to SURF Snake Game!");
+            println!("Get ready to play...\n");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            crate::game::run_game().await
+        }
+
         Commands::Get {
             url,
             include,
@@ -338,6 +384,10 @@ pub async fn execute() -> Result<()> {
         Commands::Cache { action } => {
             handle_cache_action(action).await
         }
+
+        Commands::Resume { action } => {
+            handle_resume_action(action).await
+        }
     }
 }
 
@@ -361,7 +411,6 @@ async fn handle_get_request_with_cache(
 ) -> Result<()> {
     let cache_path = CachedConfig::get_cache_path();
     let mut cached_config = CachedConfig::load_from_file(&cache_path)?;
-
     if use_cache {
         if cached_config.is_empty() {
             eprintln!("Error: No cached configuration found. Please run a command without -x first to create a cache.");
@@ -372,12 +421,12 @@ async fn handle_get_request_with_cache(
         let provided_include = if include { Some(include) } else { None };
         let provided_location = if location { Some(location) } else { None };
         let provided_headers = if !headers.is_empty() { Some(headers.clone()) } else { None };
-        let provided_connect_timeout = Some(connect_timeout).filter(|&t| t != 10); // 10是默认值
+        let provided_connect_timeout = Some(connect_timeout).filter(|&t| t != 10); // 10 是默认值
         let provided_verbose = if verbose { Some(verbose) } else { None };
         let provided_http3 = if http3 { Some(http3) } else { None };
         let provided_json = if json { Some(json) } else { None };
         let provided_analyze = if analyze { Some(analyze) } else { None };
-        let provided_save_history = Some(save_history).filter(|&s| s != true); // true是默认值
+        let provided_save_history = Some(save_history).filter(|&s| s != true); // true 是默认值
 
         let conflicts = cached_config.detect_conflicts_get(
             provided_include,
@@ -445,7 +494,7 @@ async fn handle_get_request_with_cache(
             verbose, http3, json, analyze, save_history, config, no_color
         ).await;
 
-        // 保存配置到缓存（除非禁用保存）
+        // 保存配置到缓存 (除非禁用保存)
         if !no_save && result.is_ok() {
             cached_config.update_with_get(
                 include, location, headers, connect_timeout, verbose, http3,
@@ -473,7 +522,6 @@ async fn handle_download_with_cache(
 ) -> Result<()> {
     let cache_path = CachedConfig::get_cache_path();
     let mut cached_config = CachedConfig::load_from_file(&cache_path)?;
-
     if use_cache {
         if cached_config.is_empty() {
             eprintln!("Error: No cached configuration found. Please run a command without -x first to create a cache.");
@@ -481,9 +529,9 @@ async fn handle_download_with_cache(
         }
 
         // 检查冲突
-        let provided_parallel = Some(parallel).filter(|&p| p != 4); // 4是默认值
+        let provided_parallel = Some(parallel).filter(|&p| p != 4); // 4 是默认值
         let provided_continue = if continue_download { Some(continue_download) } else { None };
-        let provided_idle_timeout = Some(idle_timeout).filter(|&t| t != 30); // 30是默认值
+        let provided_idle_timeout = Some(idle_timeout).filter(|&t| t != 30); // 30 是默认值
         let provided_http3 = if http3 { Some(http3) } else { None };
 
         let conflicts = cached_config.detect_conflicts_download(
@@ -594,7 +642,6 @@ async fn handle_benchmark_with_cache(
 ) -> Result<()> {
     let cache_path = CachedConfig::get_cache_path();
     let mut cached_config = CachedConfig::load_from_file(&cache_path)?;
-
     if use_cache {
         if cached_config.is_empty() {
             eprintln!("Error: No cached configuration found. Please run a command without -x first to create a cache.");
@@ -602,9 +649,9 @@ async fn handle_benchmark_with_cache(
         }
 
         // 检查冲突
-        let provided_requests = Some(requests).filter(|&r| r != 100); // 100是默认值
-        let provided_concurrency = Some(concurrency).filter(|&c| c != 10); // 10是默认值
-        let provided_connect_timeout = Some(connect_timeout).filter(|&t| t != 5); // 5是默认值
+        let provided_requests = Some(requests).filter(|&r| r != 100); // 100 是默认值
+        let provided_concurrency = Some(concurrency).filter(|&c| c != 10); // 10 是默认值
+        let provided_connect_timeout = Some(connect_timeout).filter(|&t| t != 5); // 5 是默认值
         let provided_http3 = if http3 { Some(http3) } else { None };
 
         let conflicts = cached_config.detect_conflicts_bench(
@@ -692,7 +739,6 @@ async fn handle_benchmark_with_cache(
 
 async fn handle_cache_action(action: CacheAction) -> Result<()> {
     let cache_path = CachedConfig::get_cache_path();
-
     match action {
         CacheAction::Show => {
             let cached_config = CachedConfig::load_from_file(&cache_path)?;
@@ -729,7 +775,6 @@ async fn handle_get_request(
     log_info(&format!("GET request to: {}", url));
     log_debug(&format!("Parameters - include: {}, location: {}, timeout: {}s, verbose: {}, http3: {}",
                        include, location, connect_timeout, verbose, http3));
-
     let start_time = Instant::now();
     let mut request_headers = HashMap::new();
 
@@ -758,9 +803,10 @@ async fn handle_get_request(
         None
     };
 
-    let client = match build_client(location, connect_timeout, http3, header_vec) {
+    // 关键修改：传入 ClientType::Get
+    let client = match build_client(location, connect_timeout, http3, header_vec, ClientType::Get) {
         Ok(client) => {
-            log_debug("HTTP client built successfully");
+            log_debug("HTTP client built successfully for GET request (300s total timeout)");
             client
         }
         Err(e) => {
@@ -923,7 +969,6 @@ async fn handle_config_action(
 async fn handle_history_action(action: HistoryAction) -> Result<()> {
     let history_path = RequestHistory::get_history_path();
     let history = RequestHistory::load_from_file(&history_path).unwrap_or_default();
-
     match action {
         HistoryAction::List { limit } => {
             let entries = history.get_recent(limit);
@@ -1027,7 +1072,6 @@ async fn handle_profile_action(
                 println!("No profiles configured");
                 return Ok(());
             }
-
             println!("Available profiles:");
             for (name, profile) in &config.profiles {
                 println!("  {} - {}", name, profile.base_url.as_ref().unwrap_or(&"No base URL".to_string()));
@@ -1072,6 +1116,187 @@ async fn handle_profile_action(
                 }
             } else {
                 println!("Profile '{}' not found", name);
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn handle_resume_action(action: ResumeAction) -> Result<()> {
+    use crate::resume::{ResumeManager, DownloadStatus};
+    use chrono::{DateTime, Local, Utc};
+
+    // 修复：添加明确的类型注解
+    let resume_manager: ResumeManager = ResumeManager::new()?;
+
+    match action {
+        ResumeAction::List => {
+            let downloads = resume_manager.list_all_downloads()?;
+
+            if downloads.is_empty() {
+                println!("No resumable downloads found");
+                return Ok(());
+            }
+
+            println!("\nResumable Downloads:");
+            println!("{:-<120}", "");
+            println!("{:<40} {:<15} {:<12} {:<12} {:<20} {:<15}",
+                     "URL", "Status", "Progress", "Size", "Last Updated", "Hash");
+            println!("{:-<120}", "");
+
+            for download in &downloads {
+                let status_str = match download.status {
+                    DownloadStatus::InProgress => "In Progress".to_string(),
+                    DownloadStatus::Paused => "Paused".to_string(),
+                    DownloadStatus::Completed => "Completed".to_string(),
+                    DownloadStatus::Failed => "Failed".to_string(),
+                };
+
+                let progress = if download.total_size > 0 {
+                    format!("{:.1}%", download.get_progress_percentage())
+                } else {
+                    "Unknown".to_string()
+                };
+
+                let size_str = if download.total_size > 0 {
+                    format!("{}", HumanBytes(download.total_size))
+                } else {
+                    "Unknown".to_string()
+                };
+
+                let url_display = if download.url.len() > 38 {
+                    format!("{}...", &download.url[..35])
+                } else {
+                    download.url.clone()
+                };
+
+                let last_update = DateTime::<Utc>::from_timestamp(download.last_update_time as i64, 0)
+                    .unwrap_or_else(|| Utc::now());
+                let local_time: DateTime<Local> = last_update.into();
+
+                println!("{:<40} {:<15} {:<12} {:<12} {:<20} {:<15}",
+                         url_display,
+                         status_str,
+                         progress,
+                         size_str,
+                         local_time.format("%Y-%m-%d %H:%M").to_string(),
+                         &download.url_hash[..12]
+                );
+            }
+            println!("{:-<120}", "");
+            println!("\nTotal: {} downloads", downloads.len());
+
+            Ok(())
+        }
+
+        ResumeAction::Show { url_or_hash } => {
+            // 尝试作为 URL 加载
+            let metadata = if let Ok(Some(meta)) = resume_manager.load_metadata(&url_or_hash) {
+                meta
+            } else {
+                // 尝试作为 hash 查找
+                let downloads = resume_manager.list_all_downloads()?;
+                downloads.into_iter()
+                    .find(|d| d.url_hash.starts_with(&url_or_hash))
+                    .ok_or_else(|| anyhow!("Download not found: {}", url_or_hash))?
+            };
+
+            println!("\nDownload Details:");
+            println!("{:-<80}", "");
+            println!("URL: {}", metadata.url);
+            println!("Hash: {}", metadata.url_hash);
+            println!("Output: {}", metadata.output_path.display());
+            println!("Status: {:?}", metadata.status);
+            println!("Total Size: {}", HumanBytes(metadata.total_size));
+            println!("Downloaded: {} ({:.1}%)",
+                     HumanBytes(metadata.downloaded),
+                     metadata.get_progress_percentage());
+            println!("Supports Range: {}", metadata.supports_range);
+
+            if let Some(ref etag) = metadata.etag {
+                println!("ETag: {}", etag);
+            }
+
+            if let Some(ref last_modified) = metadata.last_modified {
+                println!("Last-Modified: {}", last_modified);
+            }
+
+            let start_time = DateTime::<Utc>::from_timestamp(metadata.start_time as i64, 0)
+                .unwrap_or_else(|| Utc::now());
+            let last_update = DateTime::<Utc>::from_timestamp(metadata.last_update_time as i64, 0)
+                .unwrap_or_else(|| Utc::now());
+
+            println!("Started: {}", start_time.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!("Last Update: {}", last_update.format("%Y-%m-%d %H:%M:%S UTC"));
+
+            if metadata.chunks.len() > 1 {
+                println!("\nChunks ({}):", metadata.chunks.len());
+                let completed = metadata.chunks.iter().filter(|c| c.status == crate::resume::ChunkStatus::Completed).count();
+                let in_progress = metadata.chunks.iter().filter(|c| c.status == crate::resume::ChunkStatus::Downloading).count();
+                let pending = metadata.chunks.iter().filter(|c| c.status == crate::resume::ChunkStatus::Pending).count();
+                let failed = metadata.chunks.iter().filter(|c| c.status == crate::resume::ChunkStatus::Failed).count();
+
+                println!("  Completed: {}", completed);
+                println!("  In Progress: {}", in_progress);
+                println!("  Pending: {}", pending);
+                println!("  Failed: {}", failed);
+            }
+
+            if let Some(ref error) = metadata.error_message {
+                println!("\nError: {}", error);
+            }
+
+            println!("{:-<80}", "");
+
+            Ok(())
+        }
+
+        ResumeAction::Resume { url, output } => {
+            // 加载元数据
+            let metadata = resume_manager.load_metadata(&url)?
+                .ok_or_else(|| anyhow!("No resumable download found for: {}", url))?;
+
+            // 使用原输出路径或指定的路径
+            let output_path = output.unwrap_or_else(|| metadata.output_path.clone());
+
+            println!("Resuming download:");
+            println!("  URL: {}", url);
+            println!("  Output: {}", output_path.display());
+            println!("  Progress: {:.1}%", metadata.get_progress_percentage());
+
+            // 调用下载函数
+            download_file(
+                &url,
+                &output_path,
+                metadata.chunks.len(),
+                true,
+                30,
+                false,
+            ).await?;
+
+            Ok(())
+        }
+
+        ResumeAction::Cleanup { days } => {
+            println!("Cleaning up download metadata older than {} days...", days);
+            let cleaned = resume_manager.cleanup_old_metadata(days)?;
+            println!("Cleaned up {} old download(s)", cleaned);
+            Ok(())
+        }
+
+        ResumeAction::Delete { url_or_hash } => {
+            // 尝试作为 URL 删除
+            if resume_manager.delete_metadata(&url_or_hash).is_ok() {
+                println!("Deleted download metadata for: {}", url_or_hash);
+            } else {
+                // 尝试作为 hash 查找并删除
+                let downloads = resume_manager.list_all_downloads()?;
+                if let Some(download) = downloads.into_iter().find(|d| d.url_hash.starts_with(&url_or_hash)) {
+                    resume_manager.delete_metadata(&download.url)?;
+                    println!("Deleted download metadata for: {}", download.url);
+                } else {
+                    println!("Download not found: {}", url_or_hash);
+                }
             }
             Ok(())
         }
