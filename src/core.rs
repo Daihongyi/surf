@@ -22,12 +22,12 @@ const PARALLEL_DOWNLOAD_THRESHOLD: u64 = 10_000_000; // 10MB
 const MAX_REDIRECTS: usize = 10;
 const PROGRESS_UPDATE_INTERVAL: usize = 1000;
 
-// 新增：客户端类型枚举，用于区分不同场景的超时策略
+/// 客户端类型枚举，用于区分不同场景的超时策略
 #[derive(Debug, Clone, Copy)]
 pub enum ClientType {
-    Get,       // GET 请求：需要总超时限制
-    Download,  // 下载：只依赖空闲超时，无总超时限制
-    Benchmark, // 基准测试：需要较短的总超时
+    Get,
+    Download,
+    Benchmark,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,10 +44,8 @@ fn parse_header(header_str: &str) -> Result<(HeaderName, HeaderValue)> {
         .ok_or_else(|| anyhow!("Malformed header: missing colon in '{}'", header_str))?;
     let header_name = HeaderName::from_str(key.trim())
         .with_context(|| format!("Invalid header name: '{}'", key.trim()))?;
-
     let header_value = HeaderValue::from_str(value.trim())
         .with_context(|| format!("Invalid header value: '{}'", value.trim()))?;
-
     Ok((header_name, header_value))
 }
 
@@ -63,18 +61,31 @@ fn create_progress_bar(total_size: u64, initial_pos: u64) -> ProgressBar {
     pb
 }
 
-// 修改后的 build_client 函数：根据客户端类型设置不同的超时策略
+/// 安全截断字符串，确保不切断 UTF-8 字符
+fn truncate_url(url: &str, max_len: usize) -> String {
+    if url.len() <= max_len {
+        url.to_string()
+    } else {
+        let mut end = max_len;
+        while end > 0 && !url.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &url[..end])
+    }
+}
+
 pub fn build_client(
     follow_redirects: bool,
     connect_timeout: u64,
     http3: bool,
     headers: Vec<String>,
-    client_type: ClientType, // 新增参数
+    client_type: ClientType,
 ) -> Result<Client> {
     log_debug(&format!(
         "Building HTTP client - type: {:?}, redirects: {}, timeout: {}s, http3: {}",
         client_type, follow_redirects, connect_timeout, http3
     ));
+
     let mut client_builder = ClientBuilder::new();
 
     let redirect_policy = if follow_redirects {
@@ -84,22 +95,17 @@ pub fn build_client(
     };
     client_builder = client_builder.redirect(redirect_policy);
 
-    // 关键修改：根据客户端类型设置不同的超时策略
     client_builder = client_builder.connect_timeout(Duration::from_secs(connect_timeout));
 
     match client_type {
         ClientType::Get => {
-            // GET 请求：设置合理的总超时（5 分钟）
             client_builder = client_builder.timeout(Duration::from_secs(300));
             log_debug("Client configured with 300s total timeout for GET requests");
         }
         ClientType::Download => {
-            // 下载：不设置总超时，完全依赖空闲超时来判断连接是否断开
-            // 这样即使下载大文件超过 5 分钟也不会超时
             log_debug("Client configured WITHOUT total timeout for downloads (idle timeout only)");
         }
         ClientType::Benchmark => {
-            // 基准测试：设置较短的总超时（60 秒）
             client_builder = client_builder.timeout(Duration::from_secs(60));
             log_debug("Client configured with 60s total timeout for benchmarks");
         }
@@ -125,7 +131,7 @@ pub fn build_client(
             log_error("HTTP/3 support was not enabled at compile time");
             return Err(anyhow!(
                 "HTTP/3 support was not enabled at compile time. \
-                Please rebuild with `RUSTFLAGS=\"--cfg reqwest_unstable\"` and the `http3` feature."
+ Please rebuild with `RUSTFLAGS=\"--cfg reqwest_unstable\"` and the `http3` feature."
             ));
         }
         #[cfg(feature = "http3")]
@@ -152,18 +158,12 @@ pub async fn download_file(
     log_info(&format!("Starting file download from: {}", url));
     log_debug(&format!(
         "Download settings - output: {}, parallel: {}, continue: {}, idle_timeout: {}s",
-        output.display(),
-        parallel,
-        continue_download,
-        idle_timeout
+        output.display(), parallel, continue_download, idle_timeout
     ));
-    // 初始化断点续传管理器
-    let resume_manager: ResumeManager = ResumeManager::new()?;
 
-    // 关键修改：使用 ClientType::Download，不设置总超时
+    let resume_manager: ResumeManager = ResumeManager::new()?;
     let client: Client = build_client(true, DEFAULT_CONNECT_TIMEOUT, http3, vec![], ClientType::Download)?;
 
-    // 获取文件信息
     let (total_size, supports_range, etag, last_modified) = get_download_info_extended(&client, url).await?;
 
     log_info(&format!(
@@ -196,7 +196,6 @@ pub async fn download_file(
             meta.get_progress_percentage()
         ));
 
-        // 显示分片状态
         if meta.chunks.len() > 1 {
             let completed_chunks = meta.chunks.iter().filter(|c| c.status == ChunkStatus::Completed).count();
             log_info(&format!(
@@ -205,32 +204,48 @@ pub async fn download_file(
                 meta.chunks.len() - completed_chunks
             ));
         }
-
         meta.downloaded
     } else if continue_download && output.exists() {
         // 创建新的元数据
         let file_size = fs::metadata(output).await?.len();
 
-        metadata = Some(DownloadMetadata::new(
-            url.to_string(),
-            output.clone(),
-            total_size,
-            supports_range,
-            etag.clone(),
-            last_modified.clone(),
-        ));
-
-        if let Some(ref mut meta) = metadata {
-            meta.downloaded = file_size;
-            log_info(&format!(
-                "Creating new resume metadata, {} already downloaded",
-                HumanBytes(file_size)
+        // 修复：校验文件大小不超过总大小
+        if file_size > total_size && total_size > 0 {
+            log_warn(&format!(
+                "Existing file size ({}) exceeds total size ({}), truncating and starting fresh",
+                HumanBytes(file_size),
+                HumanBytes(total_size)
             ));
+            // 截断文件
+            fs::File::create(output).await?;
+            metadata = Some(DownloadMetadata::new(
+                url.to_string(),
+                output.clone(),
+                total_size,
+                supports_range,
+                etag.clone(),
+                last_modified.clone(),
+            ));
+            0
+        } else {
+            metadata = Some(DownloadMetadata::new(
+                url.to_string(),
+                output.clone(),
+                total_size,
+                supports_range,
+                etag.clone(),
+                last_modified.clone(),
+            ));
+            if let Some(ref mut meta) = metadata {
+                meta.downloaded = file_size;
+                log_info(&format!(
+                    "Creating new resume metadata, {} already downloaded",
+                    HumanBytes(file_size)
+                ));
+            }
+            file_size
         }
-
-        file_size
     } else {
-        // 全新下载
         metadata = Some(DownloadMetadata::new(
             url.to_string(),
             output.clone(),
@@ -239,7 +254,6 @@ pub async fn download_file(
             etag.clone(),
             last_modified.clone(),
         ));
-
         log_info("Starting new download");
         0
     };
@@ -254,8 +268,6 @@ pub async fn download_file(
     if let Some(ref mut meta) = metadata {
         if meta.chunks.is_empty() {
             meta.initialize_chunks(if use_parallel { parallel } else { 1 });
-
-            // 如果是断点续传，需要更新已下载的分片状态
             if downloaded > 0 {
                 update_chunks_from_progress(meta, downloaded);
             }
@@ -267,7 +279,6 @@ pub async fn download_file(
             "Using parallel download with {} connections",
             parallel
         ));
-
         download_parallel_with_resume(
             &client,
             url,
@@ -280,7 +291,6 @@ pub async fn download_file(
             .await
     } else {
         log_info("Using single connection download");
-
         download_single_with_resume(
             &client,
             url,
@@ -293,27 +303,20 @@ pub async fn download_file(
             .await
     };
 
-    // 根据结果更新元数据 - 修复类型推断问题
     if let Some(ref mut meta) = metadata {
-        let meta_ref: &mut DownloadMetadata = meta;
         match &result {
             Ok(_) => {
-                meta_ref.mark_completed();
+                meta.mark_completed();
                 log_info("Download completed successfully");
-                // 保存完成状态
-                let _ = resume_manager.save_metadata(meta_ref);
-                // 可以选择删除元数据文件，因为下载已完成
-                // let _ = resume_manager.delete_metadata(url);
+                let _ = resume_manager.save_metadata(meta);
             }
             Err(e) => {
-                meta_ref.mark_failed(&e.to_string());
+                meta.mark_failed(&e.to_string());
                 log_error(&format!("Download failed: {}", e));
-                // 保存失败状态，以便下次恢复
-                let _ = resume_manager.save_metadata(meta_ref);
+                let _ = resume_manager.save_metadata(meta);
             }
         }
     }
-
     result
 }
 
@@ -322,7 +325,6 @@ fn update_chunks_from_progress(metadata: &mut DownloadMetadata, downloaded: u64)
     let mut remaining = downloaded;
     for chunk in &mut metadata.chunks {
         let chunk_size = chunk.end - chunk.start;
-
         if remaining >= chunk_size {
             chunk.downloaded = chunk_size;
             chunk.status = ChunkStatus::Completed;
@@ -338,12 +340,10 @@ fn update_chunks_from_progress(metadata: &mut DownloadMetadata, downloaded: u64)
     }
 }
 
-async fn get_download_info(client: &Client, url: &str) -> Result<(u64, bool)> {
-    let (size, supports, _, _) = get_download_info_extended(client, url).await?;
-    Ok((size, supports))
-}
-
-async fn get_download_info_extended(client: &Client, url: &str) -> Result<(u64, bool, Option<String>, Option<String>)> {
+async fn get_download_info_extended(
+    client: &Client,
+    url: &str,
+) -> Result<(u64, bool, Option<String>, Option<String>)> {
     log_debug("Sending HEAD request to get file info");
     let response = client
         .head(url)
@@ -385,296 +385,6 @@ async fn get_download_info_extended(client: &Client, url: &str) -> Result<(u64, 
     Ok((total_size, supports_range, etag, last_modified))
 }
 
-async fn download_single(
-    client: &Client,
-    url: &str,
-    output: &PathBuf,
-    downloaded: u64,
-    total_size: u64,
-    idle_timeout: u64,
-) -> Result<()> {
-    let pb = create_progress_bar(total_size, downloaded);
-    pb.set_message("\x1b[33mConnecting...\x1b[0m");
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output)
-        .await
-        .with_context(|| format!("Failed to open output file: {}", output.display()))?;
-
-    log_debug(&format!("Opened output file: {}", output.display()));
-
-    let start_time = Instant::now();
-    let initial_downloaded = downloaded;
-    let mut current_downloaded = downloaded;
-
-    if current_downloaded >= total_size && total_size > 0 {
-        log_info("File already fully downloaded");
-        pb.finish_with_message("Already completed");
-        return Ok(());
-    }
-
-    let mut request = client.get(url);
-    if current_downloaded > 0 {
-        request = request.header("Range", format!("bytes={}-", current_downloaded));
-        log_debug(&format!("Using Range header: bytes={}-", current_downloaded));
-    }
-
-    pb.set_message("\x1b[32mDownloading...\x1b[0m");
-
-    let response = request.send().await.map_err(|e| {
-        if e.is_timeout() {
-            anyhow!(TimeoutError::ConnectTimeout)
-        } else {
-            anyhow!(e)
-        }
-    })?;
-
-    log_debug(&format!(
-        "Download request successful, status: {}",
-        response.status()
-    ));
-
-    if !response.status().is_success() {
-        let error_msg = format!("Failed to download: {}", response.status());
-        log_error(&error_msg);
-        return Err(anyhow!(error_msg));
-    }
-
-    let mut stream = response.bytes_stream();
-    let idle_duration = Duration::from_secs(idle_timeout);
-    let mut chunk_count = 0;
-    let mut last_progress_log = Instant::now();
-
-    log_info(&format!(
-        "Download started with idle timeout of {}s (no total timeout limit)",
-        idle_timeout
-    ));
-
-    loop {
-        match tokio::time::timeout(idle_duration, stream.next()).await {
-            Ok(Some(item)) => {
-                let chunk = item.context("Error receiving chunk")?;
-                file.write_all(&chunk)
-                    .await
-                    .context("Error writing to file")?;
-
-                current_downloaded += chunk.len() as u64;
-                pb.set_position(current_downloaded);
-                chunk_count += 1;
-
-                // 定期记录进度日志
-                if last_progress_log.elapsed() >= Duration::from_secs(10) {
-                    log_debug(&format!(
-                        "Download progress: {} / {} ({:.1}%), elapsed: {:.1}s",
-                        HumanBytes(current_downloaded),
-                        HumanBytes(total_size),
-                        (current_downloaded as f64 / total_size as f64) * 100.0,
-                        start_time.elapsed().as_secs_f64()
-                    ));
-                    last_progress_log = Instant::now();
-                }
-            }
-            Ok(None) => {
-                log_info(&format!(
-                    "Download stream completed, total chunks: {}, total time: {:.2}s",
-                    chunk_count,
-                    start_time.elapsed().as_secs_f64()
-                ));
-                break;
-            }
-            Err(_) => {
-                pb.set_message("\x1b[31mIDLE TIMEOUT\x1b[0m");
-                log_error(&format!(
-                    "Download failed due to idle timeout ({}s with no data) after {:.2}s total time",
-                    idle_timeout,
-                    start_time.elapsed().as_secs_f64()
-                ));
-                return Err(anyhow!(TimeoutError::IdleTimeout(idle_timeout)));
-            }
-        }
-    }
-
-    let elapsed_time = start_time.elapsed();
-    let download_size = current_downloaded - initial_downloaded;
-    let avg_speed = if elapsed_time.as_secs_f64() > 0.0 {
-        download_size as f64 / elapsed_time.as_secs_f64()
-    } else {
-        download_size as f64
-    };
-
-    let abs_path = output.canonicalize().unwrap_or_else(|_| output.clone());
-    let completion_msg = format!(
-        "Downloaded {} in {:.2}s (avg: {}/s) to: {}",
-        HumanBytes(current_downloaded),
-        elapsed_time.as_secs_f64(),
-        HumanBytes(avg_speed as u64),
-        abs_path.display()
-    );
-
-    pb.finish_with_message(completion_msg.clone());
-    log_info(&format!("Download completed successfully: {}", completion_msg));
-
-    Ok(())
-}
-
-async fn download_parallel(
-    client: &Client,
-    url: &str,
-    output: &PathBuf,
-    total_size: u64,
-    downloaded: u64,
-    parallel: usize,
-    idle_timeout: u64,
-) -> Result<()> {
-    use std::fs::File;
-    #[cfg(unix)]
-    use std::os::unix::fs::FileExt;
-    let remaining = total_size - downloaded;
-    if remaining == 0 {
-        log_info("File already fully downloaded");
-        return Ok(());
-    }
-
-    let file = File::create(output).context("Failed to create output file")?;
-    file.set_len(total_size)
-        .context("Failed to pre-allocate file size")?;
-    let file = Arc::new(file);
-
-    let chunk_size = remaining / parallel as u64;
-    if chunk_size == 0 {
-        return download_single(client, url, output, downloaded, total_size, idle_timeout).await;
-    }
-
-    log_info(&format!(
-        "Parallel download: {} chunks of ~{} bytes each (idle timeout: {}s, no total timeout)",
-        parallel,
-        HumanBytes(chunk_size),
-        idle_timeout
-    ));
-
-    let pb = Arc::new(create_progress_bar(total_size, downloaded));
-    let semaphore = Arc::new(Semaphore::new(parallel));
-    let mut tasks = Vec::new();
-    let start_time = Instant::now();
-
-    for i in 0..parallel {
-        let start = downloaded + i as u64 * chunk_size;
-        let end = if i == parallel - 1 {
-            total_size - 1
-        } else {
-            downloaded + (i + 1) as u64 * chunk_size - 1
-        };
-
-        let client = client.clone();
-        let url = url.to_string();
-        let semaphore = Arc::clone(&semaphore);
-        let pb = Arc::clone(&pb);
-        let file = Arc::clone(&file);
-
-        let task = tokio::spawn(async move {
-            let _permit = semaphore
-                .acquire()
-                .await
-                .map_err(|e| anyhow!("Failed to acquire semaphore: {}", e))?;
-
-            let response = client
-                .get(&url)
-                .header("Range", format!("bytes={}-{}", start, end))
-                .send()
-                .await
-                .context("Failed to send range request")?;
-
-            if response.status() != StatusCode::PARTIAL_CONTENT {
-                return Err(anyhow!("Server doesn't support range requests, status: {}", response.status()));
-            }
-
-            let mut stream = response.bytes_stream();
-            let mut current_pos = start;
-
-            let idle_duration = Duration::from_secs(idle_timeout);
-
-            loop {
-                match tokio::time::timeout(idle_duration, stream.next()).await {
-                    Ok(Some(chunk_result)) => {
-                        let chunk = chunk_result.context("Error receiving chunk")?;
-                        let chunk_len = chunk.len();
-
-                        let file_clone = Arc::clone(&file);
-                        let current_chunk_pos = current_pos;
-
-                        tokio::task::spawn_blocking(move || {
-                            #[cfg(unix)]
-                            {
-                                file_clone.write_at(&chunk, current_chunk_pos)?;
-                            }
-                            #[cfg(not(unix))]
-                            {
-                                let mut f = &*file_clone;
-                                use std::io::{Seek, SeekFrom};
-                                f.seek(SeekFrom::Start(current_chunk_pos))?;
-                                f.write_all(&chunk)?;
-                            }
-                            Ok::<(), std::io::Error>(())
-                        }).await.context("Spawn blocking write failed")?.context("File write operation failed")?;
-
-                        pb.inc(chunk_len as u64);
-                        current_pos += chunk_len as u64;
-                    }
-                    Ok(None) => {
-                        break;
-                    }
-                    Err(_) => {
-                        return Err(anyhow!(TimeoutError::IdleTimeout(idle_timeout)));
-                    }
-                }
-            }
-
-            Ok::<(), anyhow::Error>(())
-        });
-
-        tasks.push(task);
-    }
-
-    for (i, task) in tasks.into_iter().enumerate() {
-        match task.await {
-            Ok(Ok(())) => {
-                log_debug(&format!("Task {} completed successfully", i));
-            }
-            Ok(Err(e)) => {
-                log_error(&format!("Download task {} failed: {}", i, e));
-                pb.abandon_with_message(format!("Task {} failed: {}", i, e));
-                return Err(e);
-            }
-            Err(e) => {
-                log_error(&format!("Download task {} panicked: {}", i, e));
-                pb.abandon_with_message(format!("Task {} panicked", i));
-                return Err(anyhow!("Download task panicked: {}", e));
-            }
-        }
-    }
-
-    let elapsed = start_time.elapsed();
-    let speed = if elapsed.as_secs_f64() > 0.0 {
-        total_size as f64 / elapsed.as_secs_f64()
-    } else {
-        0.0
-    };
-
-    pb.finish_with_message(format!(
-        "Downloaded {} in {:.2}s (avg: {}/s)",
-        HumanBytes(total_size),
-        elapsed.as_secs_f64(),
-        HumanBytes(speed as u64)
-    ));
-
-    log_info(&format!(
-        "Parallel download completed successfully in {:.2}s",
-        elapsed.as_secs_f64()
-    ));
-    Ok(())
-}
-
 pub async fn benchmark_url(
     url: &str,
     requests: usize,
@@ -686,7 +396,7 @@ pub async fn benchmark_url(
         "Starting benchmark - URL: {}, requests: {}, concurrency: {}",
         url, requests, concurrency
     ));
-    // 关键修改：使用 ClientType::Benchmark，设置 60 秒总超时
+
     let client: Client = build_client(true, connect_timeout, http3, vec![], ClientType::Benchmark)?;
 
     println!(
@@ -697,7 +407,6 @@ pub async fn benchmark_url(
     let start = Instant::now();
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::new();
-
     let stats = Arc::new(BenchmarkStats::new());
 
     for i in 0..requests {
@@ -705,26 +414,19 @@ pub async fn benchmark_url(
         let url = url.to_string();
         let semaphore = Arc::clone(&semaphore);
         let stats = Arc::clone(&stats);
-
         let task = tokio::spawn(async move {
             let _permit = semaphore.acquire().await?;
             let request_start = Instant::now();
-
             let result = client.get(&url).send().await;
             let duration = request_start.elapsed();
-
             let status_code = match &result {
                 Ok(resp) => Some(resp.status().as_u16()),
                 Err(_) => None,
             };
-
             stats.record_request(duration, status_code).await;
-
             Ok::<(), anyhow::Error>(())
         });
-
         tasks.push(task);
-
         if (i + 1) % 50 == 0 {
             log_debug(&format!("Started {} requests", i + 1));
         }
@@ -773,10 +475,8 @@ impl BenchmarkStats {
     async fn record_request(&self, duration: Duration, status_code: Option<u16>) {
         let ms = duration.as_millis() as u64;
         self.response_times.lock().await.push(ms);
-
         if let Some(code) = status_code {
             *self.status_codes.lock().await.entry(code).or_insert(0) += 1;
-
             if (200..400).contains(&code) {
                 self.successful_requests.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -790,7 +490,6 @@ impl BenchmarkStats {
 
     async fn print_results(&self, total_requests: usize, total_time: Duration) {
         let rps = total_requests as f64 / total_time.as_secs_f64();
-
         let mut sorted_times = self.response_times.lock().await.clone();
         sorted_times.sort_unstable();
 
@@ -801,7 +500,6 @@ impl BenchmarkStats {
         } else {
             0
         };
-
         let p50 = percentile(&sorted_times, 0.5);
         let p95 = percentile(&sorted_times, 0.95);
         let p99 = percentile(&sorted_times, 0.99);
@@ -821,7 +519,6 @@ impl BenchmarkStats {
         println!("  99th percentile: {}", p99);
         println!();
         println!("Status Code Distribution:");
-
         for (status, count) in &*self.status_codes.lock().await {
             println!(
                 "  {}: {} ({:.1}%)",
@@ -842,6 +539,7 @@ fn percentile(sorted_data: &[u64], percentile: f64) -> u64 {
 }
 
 // ========== 断点续传支持函数 ==========
+
 async fn download_single_with_resume(
     client: &Client,
     url: &str,
@@ -852,10 +550,11 @@ async fn download_single_with_resume(
     idle_timeout: u64,
 ) -> Result<()> {
     log_debug("Starting single download with resume support");
+
     let chunk = &metadata.chunks[0];
     let start_from = chunk.start + chunk.downloaded;
 
-    if start_from >= total_size {
+    if start_from >= total_size && total_size > 0 {
         log_info("File already fully downloaded");
         return Ok(());
     }
@@ -866,7 +565,6 @@ async fn download_single_with_resume(
     ));
 
     let mut request = client.get(url);
-
     if start_from > 0 {
         log_debug(&format!("Adding Range header: bytes={}-", start_from));
         request = request.header(
@@ -876,7 +574,6 @@ async fn download_single_with_resume(
     }
 
     let response = request.send().await.context("Request failed")?;
-
     let status = response.status();
     log_debug(&format!("Response status: {}", status));
 
@@ -901,11 +598,9 @@ async fn download_single_with_resume(
     };
 
     let pb = create_progress_bar(total_size, start_from);
-
     let mut stream = response.bytes_stream();
     let mut writer = tokio::io::BufWriter::new(file);
     let start_time = Instant::now();
-
     let idle_duration = Duration::from_secs(idle_timeout);
     let mut bytes_downloaded = start_from;
     let mut save_counter = 0;
@@ -915,16 +610,13 @@ async fn download_single_with_resume(
             Ok(Some(chunk_result)) => {
                 let chunk = chunk_result.context("Error receiving chunk")?;
                 let chunk_len = chunk.len();
-
                 writer
                     .write_all(&chunk)
                     .await
                     .context("Failed to write to file")?;
-
                 pb.inc(chunk_len as u64);
                 bytes_downloaded += chunk_len as u64;
 
-                // 更新元数据
                 metadata.update_chunk_progress(0, bytes_downloaded - metadata.chunks[0].start);
 
                 // 每下载 10MB 保存一次元数据
@@ -950,8 +642,6 @@ async fn download_single_with_resume(
     }
 
     writer.flush().await.context("Failed to flush file")?;
-
-    // 保存最终状态
     metadata.set_chunk_status(0, ChunkStatus::Completed);
     resume_manager.save_metadata(metadata)?;
 
@@ -973,9 +663,12 @@ async fn download_single_with_resume(
         "Download completed successfully in {:.2}s",
         elapsed.as_secs_f64()
     ));
+
     Ok(())
 }
 
+/// 修复后的并行下载函数：使用共享原子计数器跟踪各分片进度，
+/// 并在下载过程中定期保存元数据，避免中断后丢失进度。
 async fn download_parallel_with_resume(
     client: &Client,
     url: &str,
@@ -985,8 +678,11 @@ async fn download_parallel_with_resume(
     resume_manager: &ResumeManager,
     idle_timeout: u64,
 ) -> Result<()> {
+    use futures_util::stream::FuturesUnordered;
+    use std::sync::atomic::AtomicU64;
+
     log_info("Starting parallel download with resume support");
-    // 获取未完成的分片
+
     let pending_chunks: Vec<usize> = metadata
         .chunks
         .iter()
@@ -1006,11 +702,9 @@ async fn download_parallel_with_resume(
         metadata.chunks.len()
     ));
 
-    // 创建进度条
     let pb = create_progress_bar(total_size, metadata.downloaded);
     let start_time = Instant::now();
 
-    // 打开文件用于写入
     use std::fs::OpenOptions;
     #[cfg(unix)]
     use std::os::unix::fs::FileExt;
@@ -1021,39 +715,49 @@ async fn download_parallel_with_resume(
         .open(output)
         .context("Failed to open file for writing")?;
 
+    // 修复：预分配文件大小，避免稀疏文件
+    if total_size > 0 {
+        file.set_len(total_size)
+            .context("Failed to pre-allocate file size")?;
+    }
+
     let file = Arc::new(file);
-
-    // 创建任务信号量
     let semaphore = Arc::new(Semaphore::new(pending_chunks.len()));
-    let mut tasks = Vec::new();
 
-    // 用于跟踪元数据更新
-    let metadata_save_interval = Duration::from_secs(10);
-    let mut last_save = Instant::now();
+    // 修复：使用共享原子计数器跟踪每个分片的实时下载进度
+    let chunk_progress: Vec<Arc<AtomicU64>> = metadata
+        .chunks
+        .iter()
+        .map(|c| Arc::new(AtomicU64::new(c.downloaded)))
+        .collect();
 
-    for chunk_index in pending_chunks {
+    let mut tasks = FuturesUnordered::new();
+
+    for &chunk_index in &pending_chunks {
         let client = client.clone();
         let url = url.to_string();
         let pb = pb.clone();
         let file = Arc::clone(&file);
         let semaphore = Arc::clone(&semaphore);
-
         let chunk_info = metadata.chunks[chunk_index].clone();
+        let progress = Arc::clone(&chunk_progress[chunk_index]);
+        let idx = chunk_index;
 
         let task = tokio::spawn(async move {
             let _permit = semaphore.acquire().await?;
 
             let start = chunk_info.start + chunk_info.downloaded;
-            let end = chunk_info.end - 1;
+            // 修复：使用 saturating_sub 防止整数下溢
+            let end = chunk_info.end.saturating_sub(1);
 
             if start >= chunk_info.end {
-                log_debug(&format!("Chunk {} already completed", chunk_index));
+                log_debug(&format!("Chunk {} already completed", idx));
                 return Ok::<(), anyhow::Error>(());
             }
 
             log_debug(&format!(
                 "Downloading chunk {}: bytes={}-{} (resume from {})",
-                chunk_index, chunk_info.start, end, start
+                idx, chunk_info.start, end, start
             ));
 
             let response = client
@@ -1064,7 +768,7 @@ async fn download_parallel_with_resume(
                 .context("Request failed")?;
 
             if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
-                return Err(anyhow!("Chunk {} failed with status: {}", chunk_index, response.status()));
+                return Err(anyhow!("Chunk {} failed with status: {}", idx, response.status()));
             }
 
             let mut stream = response.bytes_stream();
@@ -1076,7 +780,6 @@ async fn download_parallel_with_resume(
                     Ok(Some(chunk_result)) => {
                         let chunk = chunk_result.context("Error receiving chunk")?;
                         let chunk_len = chunk.len();
-
                         let file_clone = Arc::clone(&file);
                         let current_chunk_pos = current_pos;
 
@@ -1087,16 +790,21 @@ async fn download_parallel_with_resume(
                             }
                             #[cfg(not(unix))]
                             {
+                                use std::io::{Seek, SeekFrom, Write};
                                 let mut f = &*file_clone;
-                                use std::io::{Seek, SeekFrom};
                                 f.seek(SeekFrom::Start(current_chunk_pos))?;
                                 f.write_all(&chunk)?;
                             }
                             Ok::<(), std::io::Error>(())
-                        }).await.context("Spawn blocking write failed")?.context("File write operation failed")?;
+                        })
+                            .await
+                            .context("Spawn blocking write failed")?
+                            .context("File write operation failed")?;
 
                         pb.inc(chunk_len as u64);
                         current_pos += chunk_len as u64;
+                        // 修复：实时更新共享进度计数器
+                        progress.store(current_pos - chunk_info.start, Ordering::Relaxed);
                     }
                     Ok(None) => {
                         break;
@@ -1110,40 +818,66 @@ async fn download_parallel_with_resume(
             Ok::<(), anyhow::Error>(())
         });
 
-        tasks.push((chunk_index, task));
+        tasks.push(async move {
+            let result = task.await;
+            (chunk_index, result)
+        });
     }
 
-    // 等待所有任务完成并更新元数据
-    for (chunk_index, task) in tasks {
-        match task.await {
-            Ok(Ok(())) => {
-                log_debug(&format!("Chunk {} completed successfully", chunk_index));
-                metadata.set_chunk_status(chunk_index, ChunkStatus::Completed);
+    let mut last_save = Instant::now();
+    let save_interval = Duration::from_secs(10);
 
-                // 定期保存元数据
-                if last_save.elapsed() >= metadata_save_interval {
-                    resume_manager.save_metadata(metadata)?;
-                    last_save = Instant::now();
+    // 修复：使用 select! 在等待任务完成的同时定期保存进度
+    while !tasks.is_empty() {
+        tokio::select! {
+            Some((chunk_index, result)) = tasks.next() => {
+                // 从共享原子计数器读取最终进度
+                let downloaded = chunk_progress[chunk_index].load(Ordering::Relaxed);
+                metadata.update_chunk_progress(chunk_index, downloaded);
+
+                match result {
+                    Ok(Ok(())) => {
+                        log_debug(&format!("Chunk {} completed successfully", chunk_index));
+                        metadata.set_chunk_status(chunk_index, ChunkStatus::Completed);
+                        resume_manager.save_metadata(metadata)?;
+                        last_save = Instant::now();
+                    }
+                    Ok(Err(e)) => {
+                        log_error(&format!("Chunk {} failed: {}", chunk_index, e));
+                        metadata.set_chunk_status(chunk_index, ChunkStatus::Failed);
+                        resume_manager.save_metadata(metadata)?;
+                        pb.abandon_with_message(format!("Chunk {} failed: {}", chunk_index, e));
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        log_error(&format!("Chunk {} task panicked: {}", chunk_index, e));
+                        metadata.set_chunk_status(chunk_index, ChunkStatus::Failed);
+                        resume_manager.save_metadata(metadata)?;
+                        pb.abandon_with_message(format!("Chunk {} panicked", chunk_index));
+                        return Err(anyhow!("Chunk task panicked: {}", e));
+                    }
                 }
             }
-            Ok(Err(e)) => {
-                log_error(&format!("Chunk {} failed: {}", chunk_index, e));
-                metadata.set_chunk_status(chunk_index, ChunkStatus::Failed);
-                resume_manager.save_metadata(metadata)?;
-                pb.abandon_with_message(format!("Chunk {} failed: {}", chunk_index, e));
-                return Err(e);
-            }
-            Err(e) => {
-                log_error(&format!("Chunk {} task panicked: {}", chunk_index, e));
-                metadata.set_chunk_status(chunk_index, ChunkStatus::Failed);
-                resume_manager.save_metadata(metadata)?;
-                pb.abandon_with_message(format!("Chunk {} panicked", chunk_index));
-                return Err(anyhow!("Chunk task panicked: {}", e));
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                // 修复：定期从原子计数器读取进度并保存元数据
+                if last_save.elapsed() >= save_interval {
+                    for (i, progress) in chunk_progress.iter().enumerate() {
+                        let downloaded = progress.load(Ordering::Relaxed);
+                        metadata.update_chunk_progress(i, downloaded);
+                    }
+                    let _ = resume_manager.save_metadata(metadata);
+                    last_save = Instant::now();
+                    log_debug("Saved progress checkpoint during parallel download");
+                }
             }
         }
     }
 
-    // 最终保存
+    // 最终保存：从原子计数器读取所有分片最终进度
+    for (i, progress) in chunk_progress.iter().enumerate() {
+        let downloaded = progress.load(Ordering::Relaxed);
+        metadata.update_chunk_progress(i, downloaded);
+    }
     resume_manager.save_metadata(metadata)?;
 
     let elapsed = start_time.elapsed();
@@ -1164,5 +898,6 @@ async fn download_parallel_with_resume(
         "Parallel download completed successfully in {:.2}s",
         elapsed.as_secs_f64()
     ));
+
     Ok(())
 }

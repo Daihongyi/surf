@@ -8,7 +8,7 @@ mod response;
 mod cache;
 mod game;
 mod resume;
-
+mod traits;
 
 use anyhow::Result;
 

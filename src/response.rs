@@ -34,7 +34,11 @@ impl ResponseFormatter {
 
     pub fn format_status_line(&self, version: Version, status: StatusCode) -> String {
         let version_str = format!("{:?}", version);
-        let status_str = format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown"));
+        let status_str = format!(
+            "{} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Unknown")
+        );
 
         if self.colorize {
             let colored_status = if status.is_success() {
@@ -76,7 +80,9 @@ impl ResponseFormatter {
         }
 
         // Try to detect JSON even without proper content-type
-        if self.format_json && (content.trim_start().starts_with('{') || content.trim_start().starts_with('[')) {
+        if self.format_json
+            && (content.trim_start().starts_with('{') || content.trim_start().starts_with('['))
+        {
             let formatted = self.format_json_content(content);
             if !formatted.is_empty() && formatted != content {
                 return formatted;
@@ -88,59 +94,138 @@ impl ResponseFormatter {
 
     fn format_json_content(&self, content: &str) -> String {
         match serde_json::from_str::<Value>(content) {
-            Ok(value) => {
-                match serde_json::to_string_pretty(&value) {
-                    Ok(formatted) => {
-                        if self.colorize {
-                            self.colorize_json(&formatted)
-                        } else {
-                            formatted
-                        }
+            Ok(value) => match serde_json::to_string_pretty(&value) {
+                Ok(formatted) => {
+                    if self.colorize {
+                        self.colorize_json(&formatted)
+                    } else {
+                        formatted
                     }
-                    Err(_) => content.to_string(),
                 }
-            }
+                Err(_) => content.to_string(),
+            },
             Err(_) => content.to_string(),
         }
     }
 
+    /// 修复：实现基本的 XML/HTML 格式化
     fn format_xml_content(&self, content: &str) -> String {
-        // Basic XML formatting - in a real implementation you might use a proper XML parser
-        content.to_string()
+        let mut result = String::new();
+        let mut indent_level: usize = 0;
+        let mut current_tag = String::new();
+        let mut in_tag = false;
+        let mut in_content = false;
+
+        for ch in content.chars() {
+            match ch {
+                '<' => {
+                    // 输出之前积累的文本内容
+                    if in_content && !current_tag.trim().is_empty() {
+                        let trimmed = current_tag.trim();
+                        if !trimmed.is_empty() {
+                            for _ in 0..indent_level {
+                                result.push_str("  ");
+                            }
+                            result.push_str(trimmed);
+                            result.push('\n');
+                        }
+                    }
+                    current_tag.clear();
+                    in_tag = true;
+                    in_content = false;
+                    current_tag.push(ch);
+                }
+                '>' => {
+                    current_tag.push(ch);
+                    in_tag = false;
+                    in_content = true;
+
+                    let tag_str = current_tag.trim();
+
+                    // 处理结束标签 </...>
+                    if tag_str.starts_with("</") {
+                        if indent_level > 0 {
+                            indent_level -= 1;
+                        }
+                        for _ in 0..indent_level {
+                            result.push_str("  ");
+                        }
+                        result.push_str(tag_str);
+                        result.push('\n');
+                    }
+                    // 处理自闭合标签 <.../>
+                    else if tag_str.ends_with("/>") || tag_str.starts_with("<!")
+                        || tag_str.starts_with("<?")
+                    {
+                        for _ in 0..indent_level {
+                            result.push_str("  ");
+                        }
+                        result.push_str(tag_str);
+                        result.push('\n');
+                    }
+                    // 处理开始标签 <...>
+                    else {
+                        for _ in 0..indent_level {
+                            result.push_str("  ");
+                        }
+                        result.push_str(tag_str);
+                        result.push('\n');
+                        indent_level += 1;
+                    }
+                    current_tag.clear();
+                }
+                _ => {
+                    if in_tag {
+                        current_tag.push(ch);
+                    } else if in_content {
+                        current_tag.push(ch);
+                    }
+                }
+            }
+        }
+
+        // 输出剩余内容
+        if !current_tag.trim().is_empty() {
+            result.push_str(current_tag.trim());
+        }
+
+        if result.is_empty() {
+            content.to_string()
+        } else {
+            result
+        }
     }
 
+    /// 修复：移除冗余的 !escape_next 守卫（已在循环顶部处理）
     fn colorize_json(&self, json: &str) -> String {
-        // Simple JSON colorization
         let mut result = String::new();
         let mut in_string = false;
         let mut escape_next = false;
 
         for ch in json.chars() {
             if escape_next {
-                result.push(ch);
+                result.push_str(&format!("{}", ch.to_string().green()));
                 escape_next = false;
                 continue;
             }
 
             match ch {
-                '"' if !escape_next => {
+                '"' => {
                     in_string = !in_string;
-                    if in_string {
-                        result.push_str(&format!("{}", ch.to_string().green()));
-                    } else {
-                        result.push_str(&format!("{}", ch.to_string().green()));
-                    }
+                    result.push_str(&format!("{}", ch.to_string().green()));
                 }
                 '\\' if in_string => {
                     escape_next = true;
-                    result.push(ch);
+                    result.push_str(&format!("{}", ch.to_string().green()));
                 }
                 _ if in_string => {
                     result.push_str(&format!("{}", ch.to_string().green()));
                 }
                 ':' => result.push_str(&format!("{}", ch.to_string().blue())),
                 ',' => result.push_str(&format!("{}", ch.to_string().white())),
-                '{' | '}' | '[' | ']' => result.push_str(&format!("{}", ch.to_string().yellow())),
+                '{' | '}' | '[' | ']' => {
+                    result.push_str(&format!("{}", ch.to_string().yellow()))
+                }
                 _ => result.push(ch),
             }
         }
@@ -162,7 +247,8 @@ impl ResponseFormatter {
         output.push('\n');
 
         // Body
-        let content_type = headers.get("content-type")
+        let content_type = headers
+            .get("content-type")
             .and_then(|ct| ct.to_str().ok());
 
         let body = response.text().await?;
@@ -178,7 +264,6 @@ impl ResponseAnalyzer {
     pub fn analyze_headers(headers: &HeaderMap) -> HashMap<String, String> {
         let mut analysis = HashMap::new();
 
-        // Security headers analysis
         let security_headers = vec![
             "strict-transport-security",
             "content-security-policy",
@@ -189,31 +274,23 @@ impl ResponseAnalyzer {
 
         for header in security_headers {
             if headers.contains_key(header) {
-                analysis.insert(
-                    format!("security.{}", header),
-                    "present".to_string()
-                );
+                analysis.insert(format!("security.{}", header), "present".to_string());
             } else {
-                analysis.insert(
-                    format!("security.{}", header),
-                    "missing".to_string()
-                );
+                analysis.insert(format!("security.{}", header), "missing".to_string());
             }
         }
 
-        // Server information
         if let Some(server) = headers.get("server") {
             analysis.insert(
                 "server.type".to_string(),
-                server.to_str().unwrap_or("unknown").to_string()
+                server.to_str().unwrap_or("unknown").to_string(),
             );
         }
 
-        // Caching information
         if let Some(cache_control) = headers.get("cache-control") {
             analysis.insert(
                 "cache.control".to_string(),
-                cache_control.to_str().unwrap_or("unknown").to_string()
+                cache_control.to_str().unwrap_or("unknown").to_string(),
             );
         }
 
@@ -231,7 +308,8 @@ impl ResponseAnalyzer {
             status,
             body_size,
             response_time,
-            headers.get("server")
+            headers
+                .get("server")
                 .and_then(|s| s.to_str().ok())
                 .unwrap_or("unknown")
         )
