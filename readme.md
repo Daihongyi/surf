@@ -20,7 +20,7 @@ Surf is a modern HTTP client with advanced features for developers and system ad
 - 🌐 Experimental HTTP/3 support
 - 🔄 Automatic redirect following
 - 📈 Verbose output with performance metrics
-
+- Auto Hash Check After Download
 ## Installation
 
 ### Prerequisites
@@ -84,7 +84,7 @@ surf get [OPTIONS] <URL>
 - `--json`: Pretty print JSON responses
 - `--analyze`: Analyze response headers for security and performance
 - `--save-history <BOOL>`: Save request to history (default: true)
-
+- `--hash-check <SHA-256>`:Let the application check the Hash after download automatically with the given SHA-256 
 **Examples:**
 ```bash
 # Basic GET request
@@ -115,6 +115,7 @@ surf download [OPTIONS] <URL> <OUTPUT>
 - `-c`, `--continue-download`: Continue interrupted download
 - `-t`, `--idle-timeout <SECONDS>`: Idle timeout between packets (default: 30)
 - `--http3`: Use HTTP/3 (experimental)
+- `--hash-check <SHA256>`: Verify the completed file against a SHA-256 hash
 
 **Examples:**
 ```bash
@@ -132,6 +133,9 @@ surf download --no-save https://temp.com/temp.zip temp.zip -p 2
 
 # Download with logging enabled
 surf --log download https://cdn.example.com/software.tar.gz software.tar.gz
+
+# Verify the downloaded file
+surf download https://example.com/file.zip output.zip --hash-check 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 ### 3. Benchmark URLs (`bench`)

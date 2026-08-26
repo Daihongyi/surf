@@ -2,6 +2,7 @@ use crate::log::{log_info, log_error, log_debug, log_warn};
 use crate::resume::{DownloadMetadata, ResumeManager, ChunkStatus};
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -14,7 +15,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{fs, io::AsyncWriteExt, sync::Semaphore};
+use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt}, sync::Semaphore};
 
 // 常量定义
 const DEFAULT_CONNECT_TIMEOUT: u64 = 10;
@@ -154,12 +155,15 @@ pub async fn download_file(
     continue_download: bool,
     idle_timeout: u64,
     http3: bool,
+    expected_hash: Option<&str>,
 ) -> Result<()> {
     log_info(&format!("Starting file download from: {}", url));
     log_debug(&format!(
-        "Download settings - output: {}, parallel: {}, continue: {}, idle_timeout: {}s",
-        output.display(), parallel, continue_download, idle_timeout
+        "Download settings - output: {}, parallel: {}, continue: {}, idle_timeout: {}s, hash check: {}",
+        output.display(), parallel, continue_download, idle_timeout, expected_hash.is_some()
     ));
+
+    let expected_hash = expected_hash.map(normalize_sha256_hash).transpose()?;
 
     let resume_manager: ResumeManager = ResumeManager::new()?;
     let client: Client = build_client(true, DEFAULT_CONNECT_TIMEOUT, http3, vec![], ClientType::Download)?;
@@ -317,7 +321,71 @@ pub async fn download_file(
             }
         }
     }
-    result
+    result?;
+
+    if let Some(expected_hash) = expected_hash {
+        let actual_hash = sha256_file(output).await?;
+        if actual_hash == expected_hash {
+            log_info(&format!("SHA-256 check passed: {}", actual_hash));
+            println!("SHA-256 check passed: {}", actual_hash);
+        } else {
+            log_warn(&format!(
+                "SHA-256 check failed: expected {}, got {}",
+                expected_hash, actual_hash
+            ));
+            eprintln!(
+                "SHA-256 check failed: expected {}, got {}",
+                expected_hash, actual_hash
+            );
+            return Err(anyhow!("Downloaded file hash does not match --hash-check"));
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_sha256_hash(hash: &str) -> Result<String> {
+    let normalized = hash.trim().to_ascii_lowercase();
+    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "Invalid SHA-256 hash: expected exactly 64 hexadecimal characters"
+        ));
+    }
+    Ok(normalized)
+}
+
+async fn sha256_file(path: &PathBuf) -> Result<String> {
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("Failed to read downloaded file for hash check: {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let bytes_read = file.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_sha256_hash;
+
+    #[test]
+    fn normalizes_sha256_hash() {
+        let hash = "  ABCDEFabcdef0123456789012345678901234567890123456789012345678901  ";
+        assert_eq!(normalize_sha256_hash(hash).unwrap(), hash.trim().to_ascii_lowercase());
+    }
+
+    #[test]
+    fn rejects_invalid_sha256_hash() {
+        assert!(normalize_sha256_hash("not-a-hash").is_err());
+        assert!(normalize_sha256_hash(&"a".repeat(64)).is_ok());
+        assert!(normalize_sha256_hash(&"g".repeat(64)).is_err());
+    }
 }
 
 /// 根据已下载字节数更新分片状态

@@ -12,7 +12,7 @@ use std::{collections::HashMap, io::Write, path::PathBuf, time::Instant};
 use async_trait::async_trait;
 
 #[derive(Parser)]
-#[command(name = "surf", version = "0.5.0-A", about = "A modern HTTP client like curl with advanced features,build with rust")]
+#[command(name = "surf", version = "0.5.1-A", about = "A modern HTTP client like curl with advanced features,build with rust")]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -73,6 +73,9 @@ enum Commands {
         idle_timeout: u64,
         #[arg(long)]
         http3: bool,
+        /// Verify the downloaded file against a SHA-256 hash
+        #[arg(long, value_name = "SHA256")]
+        hash_check: Option<String>,
     },
     /// Benchmark a URL by sending multiple requests
     Bench {
@@ -179,7 +182,7 @@ pub async fn execute() -> Result<()> {
             };
             cmd.execute(&ctx).await
         }
-        Commands::Download { url, output, parallel, continue_download, idle_timeout, http3 } => {
+        Commands::Download { url, output, parallel, continue_download, idle_timeout, http3, hash_check } => {
             let cmd = DownloadCommand {
                 url, output,
                 args: DownloadArgs {
@@ -188,6 +191,7 @@ pub async fn execute() -> Result<()> {
                     idle_timeout: Some(idle_timeout).filter(|&t| t != 30),
                     http3: if http3 { Some(http3) } else { None },
                 },
+                hash_check,
             };
             cmd.execute(&ctx).await
         }
@@ -254,7 +258,7 @@ impl CacheableAction for GetCommand {
 
 #[derive(Clone)]
 struct DownloadArgs { parallel: Option<usize>, continue_download: Option<bool>, idle_timeout: Option<u64>, http3: Option<bool> }
-struct DownloadCommand { url: String, output: PathBuf, args: DownloadArgs }
+struct DownloadCommand { url: String, output: PathBuf, args: DownloadArgs, hash_check: Option<String> }
 
 #[async_trait]
 impl CacheableAction for DownloadCommand {
@@ -281,7 +285,7 @@ impl CacheableAction for DownloadCommand {
             "Download parameters - output: {}, parallel: {}, continue: {}, timeout: {}s, http3: {}",
             self.output.display(), parallel, continue_download, idle_timeout, http3
         ));
-        match download_file(&self.url, &self.output, parallel, continue_download, idle_timeout, http3).await {
+        match download_file(&self.url, &self.output, parallel, continue_download, idle_timeout, http3, self.hash_check.as_deref()).await {
             Ok(_) => {
                 log_info("Download completed successfully");
                 Ok(())
@@ -692,7 +696,7 @@ async fn handle_resume_action(action: ResumeAction) -> Result<()> {
             println!(" Progress: {:.1}%", metadata.get_progress_percentage());
             println!(" Idle timeout: {}s", idle_timeout);
             println!(" HTTP/3: {}", http3);
-            download_file(&url, &output_path, metadata.chunks.len().max(1), true, idle_timeout, http3).await?;
+            download_file(&url, &output_path, metadata.chunks.len().max(1), true, idle_timeout, http3, None).await?;
             Ok(())
         }
         ResumeAction::Cleanup { days } => {

@@ -1,6 +1,6 @@
 [package]
 name = "surf"
-version = "0.5.0-A"
+version = "0.5.1-A"
 edition = "2021"
 
 [dependencies]
